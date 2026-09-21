@@ -1,0 +1,42 @@
+# ===============================================================
+# .dockerignore - loai tru khoi build context
+# ===============================================================
+
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Env files (khong commit secrets)
+.env
+.env.local
+.env.*.local
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Docs (khong can trong image)
+*.md
+docs/
+
+# Tests (khong can trong production image)
+tests/
+
+# CI/CD
+.github/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/

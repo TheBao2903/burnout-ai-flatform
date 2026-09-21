@@ -2,94 +2,139 @@
 ==============================================================
 File: __init__.py
 
-Chức năng:
-- Export tất cả Domain Models ra ngoài package.
-- Single source of truth cho tất cả models.
-
-Cách sử dụng:
-    from app.models import User, Session, EmotionResult, ...
+Export tat ca Domain Models tu cac modules.
 ==============================================================
 """
 
 # ==========================================
-# AUTH MODELS
+# AUTH MODELS (from auth module)
 # ==========================================
-from .auth import (
-    AuthProvider,
+from app.modules.auth.models import (
+    UserRole,
+    LoginAction,
     RegisterRequest,
     LoginRequest,
-    GoogleLoginRequest,
     AuthResponse,
-    AuthSession,
-    TokenPayload,
-    TokenBlacklist,
-    UserBanInfo,
+    PasswordChangeRequest,
+    PasswordResetRequest,
+    PasswordResetConfirm,
+    AdminCreateUserRequest,
+    AdminUpdateUserRequest,
+    AdminUserResponse,
+    User,
+    Session,
 )
 
 # ==========================================
-# USER & SESSION MODELS
+# USER MODELS (from user module)
 # ==========================================
-from .user import User
-from .session import Session
+from app.modules.user.models import (
+    Gender,
+    UpdateProfileRequest,
+    ChangeEmailRequest,
+    UserProfileResponse,
+)
 
 # ==========================================
-# ASSESSMENT MODELS
+# EMOTION MODELS (from emotion module)
 # ==========================================
-from .assessment_template import AssessmentTemplate
-from .assessment_question import AssessmentQuestion, QuestionOption
-from .assessment_answer import AssessmentAnswer
-from .assessment_result import AssessmentResult
+from app.modules.emotion.models import EmotionScores, EmotionResult
 
 # ==========================================
-# INPUT MODELS (DeepFace, Survey, Chat)
+# CHAT MODELS (from chat module)
 # ==========================================
-from .emotion import EmotionResult, EmotionScores
-from .survey import SurveyResult
-from .chat import ChatResult, ChatMessage
+from app.modules.chat.models import ChatMessage, ChatResult
 
 # ==========================================
-# BURNOUT ENGINE MODELS
+# BURNOUT MODELS (from burnout module)
 # ==========================================
-from .burnout import BurnoutResult, BurnoutFactor
-from .burnout_engine_input import BurnoutEngineInput
-from .burnout_engine_output import BurnoutEngineOutput
+from app.modules.burnout.models import (
+    BurnoutFactor,
+    BurnoutResult,
+    BurnoutEngineInput,
+    BurnoutEngineOutput,
+)
 
 # ==========================================
-# INSIGHT & RECOMMENDATION MODELS
+# SURVEY MODELS (from survey module)
 # ==========================================
-from .insight import InsightResult
-from .recommendation import Recommendation
+from app.modules.survey.models import SurveyResult
 
 # ==========================================
-# KNOWLEDGE PIPELINE MODELS
+# ASSESSMENT MODELS (from assessment module)
 # ==========================================
-from .knowledge_document import KnowledgeDocument
-from .embedding_document import EmbeddingDocument
-from .vector_payload import VectorPayload
+from app.modules.assessment.models import (
+    AssessmentTemplate,
+    AssessmentQuestion,
+    QuestionOption,
+    AssessmentAnswer,
+    AssessmentResult,
+)
 
 # ==========================================
-# DASHBOARD & NOTIFICATION MODELS
+# NOTIFICATION MODELS (from notification module)
 # ==========================================
-from .timeline import Timeline
-from .notification import Notification
-from .report import Report
+from app.modules.notification.models import Notification
+
+# ==========================================
+# TIMELINE MODELS (from timeline module)
+# ==========================================
+from app.modules.timeline.models import Timeline
+
+# ==========================================
+# REPORT MODELS (from report module)
+# ==========================================
+from app.modules.report.models import Report
+
+# ==========================================
+# RECOMMENDATION MODELS (from recommendation module)
+# ==========================================
+from app.modules.recommendation.models import Recommendation
+
+# ==========================================
+# KNOWLEDGE MODELS (from knowledge module)
+# ==========================================
+from app.modules.knowledge.models import InsightResult, KnowledgeDocument, VectorPayload
 
 
 __all__ = [
     # Auth
-    "AuthProvider",
+    "UserRole",
+    "LoginAction",
     "RegisterRequest",
     "LoginRequest",
-    "GoogleLoginRequest",
     "AuthResponse",
-    "AuthSession",
-    "TokenPayload",
-    "TokenBlacklist",
-    "UserBanInfo",
-
-    # User & Session
+    "PasswordChangeRequest",
+    "PasswordResetRequest",
+    "PasswordResetConfirm",
+    "AdminCreateUserRequest",
+    "AdminUpdateUserRequest",
+    "AdminUserResponse",
     "User",
     "Session",
+
+    # User
+    "Gender",
+    "UpdateProfileRequest",
+    "ChangeEmailRequest",
+    "UserProfileResponse",
+
+    # Emotion
+    "EmotionScores",
+    "EmotionResult",
+
+    # Chat
+    "ChatMessage",
+    "ChatResult",
+
+    # Burnout
+    "BurnoutFactor",
+    "BurnoutResult",
+    "BurnoutEngineInput",
+    "BurnoutEngineOutput",
+
+    # Survey
+    "SurveyResult",
 
     # Assessment
     "AssessmentTemplate",
@@ -98,30 +143,20 @@ __all__ = [
     "AssessmentAnswer",
     "AssessmentResult",
 
-    # Input
-    "EmotionResult",
-    "EmotionScores",
-    "SurveyResult",
-    "ChatResult",
-    "ChatMessage",
+    # Notification
+    "Notification",
 
-    # Burnout Engine
-    "BurnoutResult",
-    "BurnoutFactor",
-    "BurnoutEngineInput",
-    "BurnoutEngineOutput",
+    # Timeline
+    "Timeline",
 
-    # Insight & Recommendation
-    "InsightResult",
+    # Report
+    "Report",
+
+    # Recommendation
     "Recommendation",
 
-    # Knowledge Pipeline
+    # Knowledge
+    "InsightResult",
     "KnowledgeDocument",
-    "EmbeddingDocument",
     "VectorPayload",
-
-    # Dashboard & Notification
-    "Timeline",
-    "Notification",
-    "Report",
 ]

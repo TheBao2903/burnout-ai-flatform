@@ -1,12 +1,13 @@
-# Byte-compiled / optimized / DLL files
+# =========================================================
+# Python
+# =========================================================
+
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
 
-# Distribution / packaging
+# Python packaging / distribution
 .Python
 build/
 develop-eggs/
@@ -28,49 +29,65 @@ wheels/
 *.manifest
 *.spec
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+# =========================================================
+# Virtual Environments
+# =========================================================
 
-# Unit test / coverage reports
-htmlcov/
+.env
+.env.*
+.env.local
+.env.production
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# =========================================================
+# Testing / Coverage
+# =========================================================
+
+tests/
+.pytest_cache/
+.hypothesis/
 .tox/
 .nox/
 .coverage
 .coverage.*
-.cache
-nosetests.xml
+htmlcov/
 coverage.xml
+nosetests.xml
 *.cover
 *.py,cover
-.hypothesis/
-.pytest_cache/
 
-# Translations
-*.mo
-*.pot
+# =========================================================
+# Framework / Tools
+# =========================================================
 
-# Django stuff
-*.log
+# Flask
+instance/
+.webassets-cache
+
+# Scrapy
+.scrapy
+
+# Django
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
 
-# Flask stuff
-instance/
-.webassets-cache
+# Celery
+celerybeat-schedule
 
-# Scrapy stuff
-.scrapy
-
-# Sphinx documentation
+# Sphinx
 docs/_build/
 
-# PyBuilder
-target/
+# MkDocs
+/site
 
-# Jupyter Notebook
-.ipynb_checkpoints
+# Jupyter
+.ipynb_checkpoints/
 
 # IPython
 profile_default/
@@ -79,40 +96,25 @@ ipython_config.py
 # pyenv
 .python-version
 
-# celery beat schedule file
-celerybeat-schedule
+# mypy
+.mypy_cache/
+dmypy.json
+.dmypy.json
 
-# SageMath parsed files
-*.sage.py
+# Pyre
+.pyre/
 
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Spyder project settings
+# Spyder
 .spyderproject
 .spyproject
 
-# Rope project settings
+# Rope
 .ropeproject
 
-# mkdocs documentation
-/site
+# =========================================================
+# IDE / Editor
+# =========================================================
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# IDEs
 .idea/
 .vscode/
 *.swp
@@ -120,7 +122,49 @@ dmypy.json
 *~
 .DS_Store
 
-# Model weights (if any)
+# =========================================================
+# Claude Code
+# =========================================================
+
+.claude/
+
+# =========================================================
+# Logs
+# =========================================================
+
+*.log
+logs/
+
+# =========================================================
+# Secrets / Credentials / Keys
+# =========================================================
+
+# Firebase Service Account
+config/serviceAccountKey.json
+config/*.json
+!config/.gitkeep
+
+# Environment / local secrets
+*.pem
+*.key
+*.secret
+*.local.*
+*secret*
+
+# Credential files
+credentials.json
+secrets.json
+secrets.yaml
+
+# Cloud credentials
+*.aws/credentials
+gcloud-*.json
+application_default_credentials.json
+
+# =========================================================
+# AI / ML Model Weights
+# =========================================================
+
 *.h5
 *.pb
 *.pt
@@ -130,10 +174,8 @@ dmypy.json
 *.pkl
 *.pickle
 
-# Logs
-*.log
-logs/
+# =========================================================
+# Local Configuration
+# =========================================================
 
-# Local config (secrets, API keys)
 config.local.py
-*.local.*
