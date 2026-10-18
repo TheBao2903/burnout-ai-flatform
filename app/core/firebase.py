@@ -18,6 +18,8 @@ Cách sử dụng:
 ==============================================================
 """
 
+import json
+import logging
 import os
 from pathlib import Path
 from typing import Optional
@@ -25,6 +27,8 @@ from typing import Optional
 import firebase_admin
 from firebase_admin import auth as fb_auth
 from firebase_admin import credentials, firestore
+
+logger = logging.getLogger("firebase.core")
 
 
 class FirebaseConfig:
@@ -53,21 +57,52 @@ class FirebaseConfig:
         """
         Khởi tạo Firebase Admin SDK.
 
+        Hỗ trợ:
+        1. JSON string trực tiếp qua env `FIREBASE_SERVICE_ACCOUNT_JSON` hoặc `FIREBASE_CREDENTIALS_JSON`.
+        2. JSON string hoặc file path trong `GOOGLE_APPLICATION_CREDENTIALS` / `credential_path`.
+        3. Application Default Credentials (ADC) khi chạy trên GCP / Cloud Run.
+
         Args:
-            credential_path: Đường dẫn đến service account JSON file.
-                           Nếu None, sẽ dùng GOOGLE_APPLICATION_CREDENTIALS env var.
-            project_id: Firebase project ID. Nếu None, dùng từ credentials.
+            credential_path: Đường dẫn đến file JSON hoặc JSON string.
+            project_id: Firebase project ID (tuỳ chọn).
         """
         if self._app is not None:
             return  # Đã initialize rồi
 
-        # Tìm credentials
-        if credential_path is None:
-            credential_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        cred = None
 
-        if credential_path:
-            # Sử dụng service account file
-            cred = credentials.Certificate(credential_path)
+        # 1. Thử lấy raw JSON string từ environment variables (rất phổ biến khi deploy Docker/Cloud)
+        raw_json = (
+            os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+            or os.getenv("FIREBASE_CREDENTIALS_JSON")
+        )
+
+        if not raw_json and credential_path and credential_path.strip().startswith("{"):
+            raw_json = credential_path
+
+        env_cred = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if not raw_json and env_cred and env_cred.strip().startswith("{"):
+            raw_json = env_cred
+
+        if raw_json:
+            try:
+                cert_dict = json.loads(raw_json.strip())
+                cred = credentials.Certificate(cert_dict)
+                logger.info("Firebase initialized using raw JSON credentials.")
+            except Exception as e:
+                logger.error(f"Failed to parse Firebase raw JSON credentials: {e}")
+
+        # 2. Nếu không có raw JSON, kiểm tra file path
+        if cred is None:
+            target_path = credential_path or env_cred
+            if target_path:
+                p = Path(target_path)
+                if p.is_file():
+                    cred = credentials.Certificate(str(p.resolve()))
+                    logger.info(f"Firebase initialized from certificate file: {p}")
+
+        # 3. Khởi tạo App
+        if cred is not None:
             self._app = firebase_admin.initialize_app(
                 cred,
                 options={"projectId": project_id} if project_id else None
@@ -75,6 +110,7 @@ class FirebaseConfig:
         else:
             # Thử dùng Application Default Credentials (ADC)
             # Phù hợp cho Cloud Run, GCE, local dev với gcloud auth
+            logger.info("Initializing Firebase using Application Default Credentials (ADC).")
             self._app = firebase_admin.initialize_app()
 
         # Initialize Firestore client
@@ -87,11 +123,24 @@ class FirebaseConfig:
         """
         if self._db is None:
             try:
-                root_path = Path(__file__).resolve().parent.parent.parent
-                cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or str(root_path / "config" / "serviceAccountKey.json")
-                if not Path(cred_path).is_absolute():
-                    cred_path = str(root_path / cred_path)
-                self.initialize(credential_path=cred_path if Path(cred_path).exists() else None)
+                # Kiểm tra nếu có raw JSON env var
+                if (
+                    os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+                    or os.getenv("FIREBASE_CREDENTIALS_JSON")
+                ):
+                    self.initialize()
+                else:
+                    root_path = Path(__file__).resolve().parent.parent.parent
+                    cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or str(
+                        root_path / "config" / "serviceAccountKey.json"
+                    )
+                    if cred_path.strip().startswith("{"):
+                        self.initialize(credential_path=cred_path)
+                    else:
+                        p = Path(cred_path)
+                        if not p.is_absolute():
+                            p = root_path / p
+                        self.initialize(credential_path=str(p) if p.exists() else None)
             except Exception as e:
                 raise RuntimeError(
                     f"Firebase chưa được khởi tạo và lazy init thất bại: {e}"

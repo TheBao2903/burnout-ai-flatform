@@ -70,14 +70,18 @@ async def lifespan(app: FastAPI):
     logger.info("Environment: %s", settings.server.environment)
 
     try:
+        raw_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON") or os.getenv("FIREBASE_CREDENTIALS_JSON")
         cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "config/serviceAccountKey.json"
-        abs_cred_path = pathlib.Path(cred_path)
-        if not abs_cred_path.is_absolute():
-            abs_cred_path = _ROOT / cred_path
-        if abs_cred_path.exists():
-            init_firebase(credential_path=str(abs_cred_path))
-        else:
+        if raw_json or (cred_path and cred_path.strip().startswith("{")):
             init_firebase()
+        else:
+            abs_cred_path = pathlib.Path(cred_path)
+            if not abs_cred_path.is_absolute():
+                abs_cred_path = _ROOT / cred_path
+            if abs_cred_path.exists():
+                init_firebase(credential_path=str(abs_cred_path))
+            else:
+                init_firebase()
         logger.info("Firebase initialized")
     except Exception as exc:
         logger.warning("Firebase init failed: %s. App continues without Firestore.", exc)

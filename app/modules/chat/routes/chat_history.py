@@ -10,6 +10,7 @@ GET  /api/v1/assessments/{id}/chat/summary - Tom tat session chat
 ==============================================================
 """
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
@@ -636,7 +637,8 @@ async def send_chat_message(
     assistant_content = None
     try:
         response_generator = get_chat_response_generator()
-        chat_response = response_generator.generate_response(
+        chat_response = await asyncio.to_thread(
+            response_generator.generate_response,
             user_message=request.message,
             stage=current_stage,                  # BẮT BUỘC từ route
             conversation_history=history_for_ai,
@@ -1264,7 +1266,8 @@ async def get_initial_greeting(
             from app.modules.chat.services.probing_questions import (
                 STA_QUESTION_CATALOG,
             )
-            response = generator.generate_response(
+            response = await asyncio.to_thread(
+                generator.generate_response,
                 user_message="(Đây là lượt mở đầu phiên - hãy chào và đặt câu hỏi trọng tâm)",
                 analysis_context=None,
                 conversation_history=[],
