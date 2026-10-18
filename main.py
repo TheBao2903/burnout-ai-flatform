@@ -70,21 +70,21 @@ async def lifespan(app: FastAPI):
     logger.info("Environment: %s", settings.server.environment)
 
     try:
+        from app.core.firebase import find_firebase_credential_path
         raw_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON") or os.getenv("FIREBASE_CREDENTIALS_JSON")
-        cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "config/serviceAccountKey.json"
-        if raw_json or (cred_path and cred_path.strip().startswith("{")):
+        cred_env = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+        if raw_json or cred_env.strip().startswith("{"):
             init_firebase()
         else:
-            found_path = None
-            for p in [
-                pathlib.Path(cred_path) if pathlib.Path(cred_path).is_absolute() else _ROOT / cred_path,
-                pathlib.Path("/etc/secrets/serviceAccountKey.json"),
-                pathlib.Path("/etc/secrets/config/serviceAccountKey.json"),
-            ]:
-                if p.is_file():
-                    found_path = str(p)
-                    break
-            init_firebase(credential_path=found_path)
+            found_path = find_firebase_credential_path()
+            if found_path:
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = found_path
+                init_firebase(credential_path=found_path)
+            else:
+                if "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
+                    if not pathlib.Path(os.environ["GOOGLE_APPLICATION_CREDENTIALS"]).exists():
+                        del os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+                init_firebase()
         logger.info("Firebase initialized")
     except Exception as exc:
         logger.warning("Firebase init failed: %s. App continues without Firestore.", exc)

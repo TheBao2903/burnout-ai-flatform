@@ -31,6 +31,65 @@ from firebase_admin import credentials, firestore
 logger = logging.getLogger("firebase.core")
 
 
+def find_firebase_credential_path(custom_path: Optional[str] = None) -> Optional[str]:
+    """
+    Tự động dò tìm file service account key ở mọi vị trí có thể có:
+    - Custom path / GOOGLE_APPLICATION_CREDENTIALS
+    - /etc/secrets/ (Render Secret Files mount)
+    - App root (/app/serviceAccountKey.json hoặc ./serviceAccountKey.json)
+    - config/serviceAccountKey.json
+    """
+    root_path = Path(__file__).resolve().parent.parent.parent
+    env_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+    candidates = [
+        custom_path,
+        env_path,
+        "/etc/secrets/serviceAccountKey.json",
+        "/etc/secrets/config/serviceAccountKey.json",
+        str(root_path / "serviceAccountKey.json"),
+        str(root_path / "config" / "serviceAccountKey.json"),
+        "serviceAccountKey.json",
+        "config/serviceAccountKey.json",
+        "/app/serviceAccountKey.json",
+        "/app/config/serviceAccountKey.json",
+    ]
+
+    for c in candidates:
+        if c and not c.strip().startswith("{"):
+            p = Path(c)
+            if not p.is_absolute():
+                p_cand = root_path / p
+                if p_cand.exists() and (p_cand.is_file() or p_cand.is_symlink()):
+                    logger.info("Found Firebase credential at: %s", p_cand.resolve())
+                    return str(p_cand.resolve())
+            if p.exists() and (p.is_file() or p.is_symlink()):
+                logger.info("Found Firebase credential at: %s", p.resolve())
+                return str(p.resolve())
+
+    # Quét thư mục /etc/secrets (Render secret files)
+    sec_dir = Path("/etc/secrets")
+    if sec_dir.exists():
+        try:
+            for jf in sec_dir.glob("*.json"):
+                if jf.is_file() or jf.is_symlink():
+                    logger.info("Found Firebase credential in /etc/secrets: %s", jf.resolve())
+                    return str(jf.resolve())
+        except Exception as e:
+            logger.warning("Error reading /etc/secrets: %s", e)
+
+    # Quét thư mục root
+    try:
+        for jf in root_path.glob("*.json"):
+            if (jf.is_file() or jf.is_symlink()) and ("serviceAccount" in jf.name or "firebase" in jf.name):
+                logger.info("Found Firebase credential in app root: %s", jf.resolve())
+                return str(jf.resolve())
+    except Exception as e:
+        logger.warning("Error reading root path: %s", e)
+
+    return None
+
+
 class FirebaseConfig:
     """
     Singleton class quản lý Firebase connection.
@@ -94,19 +153,11 @@ class FirebaseConfig:
 
         # 2. Nếu không có raw JSON, kiểm tra file path
         if cred is None:
-            possible_paths = [
-                credential_path,
-                env_cred,
-                "/etc/secrets/serviceAccountKey.json",
-                "/etc/secrets/config/serviceAccountKey.json",
-            ]
-            for tp in possible_paths:
-                if tp:
-                    p = Path(tp)
-                    if p.is_file():
-                        cred = credentials.Certificate(str(p.resolve()))
-                        logger.info(f"Firebase initialized from certificate file: {p}")
-                        break
+            found_file = find_firebase_credential_path(credential_path)
+            if found_file:
+                cred = credentials.Certificate(found_file)
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = found_file
+                logger.info(f"Firebase initialized from certificate file: {found_file}")
 
         # 3. Khởi tạo App
         if cred is not None:
@@ -118,6 +169,10 @@ class FirebaseConfig:
             # Thử dùng Application Default Credentials (ADC)
             # Phù hợp cho Cloud Run, GCE, local dev với gcloud auth
             logger.info("Initializing Firebase using Application Default Credentials (ADC).")
+            # Xoá env var nếu trỏ vào file không tồn tại để ADC không crash
+            if "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
+                if not Path(os.environ["GOOGLE_APPLICATION_CREDENTIALS"]).exists():
+                    del os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
             self._app = firebase_admin.initialize_app()
 
         # Initialize Firestore client
@@ -137,23 +192,8 @@ class FirebaseConfig:
                 ):
                     self.initialize()
                 else:
-                    root_path = Path(__file__).resolve().parent.parent.parent
-                    cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or str(
-                        root_path / "config" / "serviceAccountKey.json"
-                    )
-                    if cred_path.strip().startswith("{"):
-                        self.initialize(credential_path=cred_path)
-                    else:
-                        found_path = None
-                        for cand in [
-                            Path(cred_path) if Path(cred_path).is_absolute() else root_path / cred_path,
-                            Path("/etc/secrets/serviceAccountKey.json"),
-                            Path("/etc/secrets/config/serviceAccountKey.json"),
-                        ]:
-                            if cand.is_file():
-                                found_path = str(cand)
-                                break
-                        self.initialize(credential_path=found_path)
+                    found_path = find_firebase_credential_path()
+                    self.initialize(credential_path=found_path)
             except Exception as e:
                 raise RuntimeError(
                     f"Firebase chưa được khởi tạo và lazy init thất bại: {e}"
