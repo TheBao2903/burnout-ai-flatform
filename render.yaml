@@ -1,8 +1,9 @@
+# yaml-language-server: $schema=https://render.com/schema/render.yaml.json
 services:
   - type: web
     name: burnout-ai-backend
-    env: docker
-    dockerfilePath: Dockerfile
+    runtime: docker
+    dockerfilePath: ./Dockerfile
     plan: free
     region: singapore
     autoDeploy: true
@@ -11,12 +12,25 @@ services:
         value: production
       - key: DEBUG
         value: "false"
-      - key: GEMINI_API_KEY
-        sync: false
-      - key: SECRET_KEY
-        generateValue: true
       - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: GOOGLE_API_KEY_2
+        sync: false
+      - key: GOOGLE_API_KEY_3
+        sync: false
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_NAME
+        value: burnout-ai-platform
+      - key: R2_PUBLIC_URL
+        sync: false
+      - key: GEOAPIFY_API_KEY
         sync: false
       - key: ALLOWED_ORIGINS
         value: "*"
-
