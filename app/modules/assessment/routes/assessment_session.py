@@ -85,6 +85,7 @@ class AssessmentAnalyzeResponse(BaseModel):
     status: str
     burnout_result_id: Optional[str] = None
     message: str
+    result: Optional[dict] = None
 
 
 # ==========================================
@@ -263,9 +264,13 @@ async def run_burnout_analysis(
         emotions = emotion_repo.list_by_assessment(assessment_id, limit=100)
         logger.info("Loaded %d emotion records for assessment %s", len(emotions), assessment_id)
 
-        # Load survey
+        # Load survey (Daily Check-in)
         survey = survey_repo.get_by_assessment(assessment_id)
         logger.info("Loaded survey for assessment %s: %s", assessment_id, bool(survey))
+
+        # Load latest periodic survey for user (Job Resources & Six Areas)
+        periodic_survey = survey_repo.get_latest_periodic_survey(user_id)
+        logger.info("Loaded periodic survey for user %s: %s", user_id, bool(periodic_survey))
 
         # Load chat history
         chats = chat_repo.get_messages_by_assessment(assessment_id, limit=100)
@@ -273,7 +278,6 @@ async def run_burnout_analysis(
 
         # Load historical burnout results (exclude current)
         historical_results = burnout_repo.list_by_user(user_id, limit=20)
-        # Filter out current assessment if present
         historical_results = [
             r for r in historical_results
             if r.get("assessment_id") != assessment_id
@@ -293,6 +297,9 @@ async def run_burnout_analysis(
             historical_results=historical_results,
         )
         burnout_input = builder.build()
+        if periodic_survey:
+            burnout_input.periodic_survey = periodic_survey
+
         logger.info(
             "Built BurnoutInput for %s: completeness=%.2f",
             assessment_id,
@@ -323,11 +330,12 @@ async def run_burnout_analysis(
         # Convert recommendations to dict
         recommendation_dicts = [
             {
-                "title": r.title,
-                "description": r.description,
-                "priority": r.priority,
-                "target_factor": r.target_factor,
+                "title": getattr(r, "title", str(r)),
+                "description": getattr(r, "description", ""),
+                "priority": getattr(r, "priority", "medium"),
+                "target_factor": getattr(r, "target_factor", None),
             }
+            if not isinstance(r, dict) else r
             for r in recommendations
         ]
         logger.info(
@@ -336,11 +344,20 @@ async def run_burnout_analysis(
             assessment_id,
         )
 
-        # 8. Persist burnout result
-        # Map BurnoutResult to Firestore document
+        # 8. Persist burnout result with STA schema + backward compatibility
         burnout_doc = {
             "assessment_id": assessment_id,
             "user_id": user_id,
+            "engine_version": burnout_result.engine_version,
+            "burnout_core": burnout_result.burnout_core.model_dump() if hasattr(burnout_result.burnout_core, "model_dump") else burnout_result.burnout_core,
+            "context": burnout_result.context.model_dump() if hasattr(burnout_result.context, "model_dump") else burnout_result.context,
+            "supporting_signals": burnout_result.supporting_signals.model_dump() if hasattr(burnout_result.supporting_signals, "model_dump") else burnout_result.supporting_signals,
+            "data_quality": burnout_result.data_quality,
+            "data_sufficiency": burnout_result.data_sufficiency,
+            "interpretation": burnout_result.interpretation,
+            "confidence": burnout_result.confidence,
+            "disclaimer": burnout_result.disclaimer,
+            # Legacy fields
             "burnout_score": burnout_result.burnout_score,
             "data_completeness": burnout_result.data_completeness,
             "risk_level": burnout_result.risk_level,
@@ -356,7 +373,7 @@ async def run_burnout_analysis(
                 for f in burnout_result.factors
             ],
             "recommendations": recommendation_dicts,
-            "insight": engine_output.insight,
+            "insight": engine_output.insight.model_dump() if hasattr(engine_output.insight, "model_dump") else engine_output.insight,
             "analyzed_at": burnout_result.analyzed_at,
         }
 
@@ -375,6 +392,7 @@ async def run_burnout_analysis(
             status="completed",
             burnout_result_id=burnout_result_id,
             message="Burnout analysis completed successfully.",
+            result=burnout_doc,
         )
 
     except Exception as exc:

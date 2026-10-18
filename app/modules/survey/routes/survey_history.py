@@ -28,6 +28,9 @@ from app.modules.survey.services.survey_analysis_service import (
     SurveyAnalysisService,
     get_survey_analysis_service,
 )
+from app.modules.survey.services.survey_ai_interpreter import (
+    get_survey_ai_interpreter,
+)
 from app.modules.recommendation.services.place_recommendation_service import (
     get_place_recommendation_service,
 )
@@ -66,37 +69,44 @@ class SurveySubmitRequest(BaseModel):
     """Request body cho POST /survey.
 
     CLEAN ARCHITECTURE:
-    - Survey CHỉ nhận raw answers
-    - KHÔNG nhận analysis_result (thuộc BurnoutResult)
-    - KHÔNG nhận recommendations (thuộc Recommendation Engine)
+    - Survey CHỈ nhận raw answers
+    - Hỗ trợ cả cấu trúc STA (Exhaustion, Disengagement, Job Demands, Recovery, Quick Overload)
+      lẫn flattened/legacy fields.
     """
+    # STA Structured Groups
+    exhaustion: Optional[Dict[str, Any]] = None
+    disengagement: Optional[Dict[str, Any]] = None
+    job_demands: Optional[Dict[str, Any]] = None
+    recovery: Optional[Dict[str, Any]] = None
+    quick_overload_data: Optional[Dict[str, Any]] = None
+    work_changes: Optional[Dict[str, Any]] = None
 
-    sleep_hours: float = Field(..., ge=0.0, le=24.0, description="Số giờ ngủ")
-    working_hours: float = Field(..., ge=0.0, le=24.0, description="Số giờ làm việc/ngày")
-    overtime_hours: int = Field(default=0, ge=0, le=24, description="Số giờ tăng ca")
-    has_deadline: str = Field(..., description="Mức độ deadline: low/medium/high/extreme")
-    work_days_per_week: int = Field(..., ge=1, le=7, description="Số ngày làm việc/tuần")
-    stress_level: int = Field(..., ge=1, le=10, description="Mức độ stress (1-10)")
-    motivation_level: int = Field(default=5, ge=1, le=10, description="Mức độ động lực (1-10)")
+    # STA Flattened Daily Check-in fields
+    sleep_hours: Optional[float] = Field(default=None, ge=0.0, le=24.0, description="Số giờ ngủ đêm qua")
+    recovery_score: Optional[int] = Field(default=None, ge=1, le=5, description="Cảm nhận hồi phục (1-5)")
+    quick_overload: Optional[int] = Field(default=None, ge=1, le=5, description="Mức độ quá tải (1-5)")
+    overload_reasons: List[str] = Field(default_factory=list, description="Lý do quá tải")
+    has_overtime_today: Optional[bool] = Field(default=None, description="Có làm thêm hôm nay không")
+    overtime_hours_today: Optional[float] = Field(default=None, ge=0.0, le=24.0, description="Số giờ tăng ca hôm nay")
+    current_deadline_pressure: Optional[str] = Field(default=None, description="Áp lực deadline (low, medium, high, extreme)")
 
-    # Optional fields
+    # Legacy fields (optional with defaults for backward compatibility)
+    working_hours: Optional[float] = Field(default=8.0, ge=0.0, le=24.0, description="Số giờ làm việc/ngày")
+    overtime_hours: Optional[int] = Field(default=0, ge=0, le=24, description="Số giờ tăng ca")
+    has_deadline: Optional[str] = Field(default="medium", description="Mức độ deadline")
+    work_days_per_week: Optional[int] = Field(default=5, ge=1, le=7, description="Số ngày làm việc/tuần")
+    stress_level: Optional[int] = Field(default=5, ge=1, le=10, description="Mức độ stress (1-10)")
+    motivation_level: Optional[int] = Field(default=5, ge=1, le=10, description="Mức độ động lực (1-10)")
     consecutive_work_days: Optional[int] = Field(default=None, ge=0, le=30)
     rest_days: Optional[int] = Field(default=None, ge=0, le=7)
     work_satisfaction: Optional[int] = Field(default=None, ge=1, le=10)
     heart_rate: Optional[int] = Field(default=None, ge=30, le=220)
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "sleep_hours": 5.5,
-                "working_hours": 10.0,
-                "overtime_hours": 3,
-                "has_deadline": "high",
-                "work_days_per_week": 6,
-                "stress_level": 8,
-                "motivation_level": 3
-            }
-        }
+
+class PeriodicSurveySubmitRequest(BaseModel):
+    """Request body cho POST /api/survey/periodic."""
+    job_resources: Dict[str, Optional[float]] = Field(..., description="JR1-JR4 scores (1-5)")
+    six_areas: Dict[str, Optional[float]] = Field(..., description="Six Areas scores (1-5)")
 
 
 class SurveyResponse(BaseModel):
@@ -114,6 +124,8 @@ class SurveyQuestionsResponse(BaseModel):
     """Response cho /questions endpoint."""
 
     questions: list
+    daily_questions: Optional[list] = None
+    periodic_questions: Optional[list] = None
 
 
 # ==========================================
@@ -123,13 +135,14 @@ class SurveyQuestionsResponse(BaseModel):
 class AnalyzeRequest(BaseModel):
     """Request body cho POST /api/survey/analyze."""
 
-    sleep_hours: float = Field(..., ge=0.0, le=24.0, description="Số giờ ngủ")
-    working_hours: float = Field(..., ge=0.0, le=24.0, description="Số giờ làm việc/ngày")
-    overtime_hours: int = Field(default=0, ge=0, le=24, description="Số giờ tăng ca")
-    has_deadline: str = Field(..., description="Mức độ deadline: low/medium/high/extreme")
-    work_days_per_week: int = Field(..., ge=1, le=7, description="Số ngày làm việc/tuần")
-    stress_level: int = Field(..., ge=1, le=10, description="Mức độ stress (1-10)")
-    motivation_level: int = Field(default=5, ge=1, le=10, description="Mức độ động lực (1-10)")
+    # Optional legacy fields with defaults
+    sleep_hours: Optional[float] = Field(default=7.0, ge=0.0, le=24.0, description="Số giờ ngủ")
+    working_hours: Optional[float] = Field(default=8.0, ge=0.0, le=24.0, description="Số giờ làm việc/ngày")
+    overtime_hours: Optional[int] = Field(default=0, ge=0, le=24, description="Số giờ tăng ca")
+    has_deadline: Optional[str] = Field(default="medium", description="Mức độ deadline: low/medium/high/extreme")
+    work_days_per_week: Optional[int] = Field(default=5, ge=1, le=7, description="Số ngày làm việc/tuần")
+    stress_level: Optional[int] = Field(default=5, ge=1, le=10, description="Mức độ stress (1-10)")
+    motivation_level: Optional[int] = Field(default=5, ge=1, le=10, description="Mức độ động lực (1-10)")
 
     # Optional fields
     consecutive_work_days: Optional[int] = Field(default=None, ge=0, le=30)
@@ -137,20 +150,13 @@ class AnalyzeRequest(BaseModel):
     work_satisfaction: Optional[int] = Field(default=None, ge=1, le=10)
     heart_rate: Optional[int] = Field(default=None, ge=30, le=220)
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "sleep_hours": 5.5,
-                "working_hours": 10.0,
-                "overtime_hours": 3,
-                "has_deadline": "high",
-                "work_days_per_week": 6,
-                "stress_level": 8,
-                "motivation_level": 3,
-                "consecutive_work_days": 5,
-                "rest_days": 1,
-            }
-        }
+    # STA Scientific Dimension Groups (OLBI & JD-R)
+    exhaustion: Optional[Dict[str, Any]] = None
+    disengagement: Optional[Dict[str, Any]] = None
+    job_demands: Optional[Dict[str, Any]] = None
+    recovery: Optional[Dict[str, Any]] = None
+    quick_overload_data: Optional[Dict[str, Any]] = None
+    work_changes: Optional[Dict[str, Any]] = None
 
 
 class AnalysisFactorResponse(BaseModel):
@@ -173,6 +179,16 @@ class RecommendationResponse(BaseModel):
     severity: str
 
 
+class AIInsightResponse(BaseModel):
+    """Kết quả phân tích định tính từ Gemini AI."""
+
+    current_state_text: str
+    change_text: str
+    contributing_factors_text: str
+    reflection_question: str
+    suggested_chat_prompt: str
+
+
 class AnalyzeResponse(BaseModel):
     """Response cho POST /api/survey/analyze."""
 
@@ -182,6 +198,7 @@ class AnalyzeResponse(BaseModel):
     factors: List[AnalysisFactorResponse]
     recommendations: List[RecommendationResponse]
     analysis_version: str
+    ai_insight: Optional[AIInsightResponse] = None
 
 
 # ==========================================
@@ -242,6 +259,31 @@ class RecommendationsResponse(BaseModel):
     address: Optional[str] = None
     message: str
 
+class DimensionStats(BaseModel):
+    current: Optional[float] = None
+    average: Optional[float] = None
+    trend: str = 'stable'
+    values: List[float] = Field(default_factory=list)
+
+class RollingStatsResponse(BaseModel):
+    user_id: str
+    period_days: int = 7
+    total_surveys: int = 0
+    dimensions: Dict[str, DimensionStats] = Field(default_factory=dict)
+    overall_trend: str = 'stable'
+    computed_at: str = ''
+
+class AlertItem(BaseModel):
+    type: str
+    severity: str
+    title: str
+    message: str
+    consecutive_days: int = 0
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+class AlertsResponse(BaseModel):
+    alerts: List[AlertItem] = Field(default_factory=list)
+    has_critical: bool = False
 
 # ==========================================
 # Dependency
@@ -255,17 +297,45 @@ def get_survey_repo() -> SurveyHistoryRepository:
 # Endpoints
 # ==========================================
 
+@router.get("/questions", response_model=SurveyQuestionsResponse)
 @router.get("/{assessment_id}/survey/questions", response_model=SurveyQuestionsResponse)
 async def get_survey_questions(
-    assessment_id: str,
+    assessment_id: Optional[str] = None,
     user: dict = Depends(get_current_user),
 ):
-    """Lấy danh sách câu hỏi survey.
+    """Lấy danh sách câu hỏi survey (cả daily và periodic)."""
+    return SurveyQuestionsResponse(
+        questions=SurveyQuestions.DAILY_QUESTIONS,
+        daily_questions=SurveyQuestions.DAILY_QUESTIONS,
+        periodic_questions=SurveyQuestions.PERIODIC_QUESTIONS,
+    )
 
-    Câu hỏi là static, không cần query DB.
-    """
-    questions = SurveyQuestions()
-    return SurveyQuestionsResponse(questions=questions.questions)
+
+@router.post("/periodic")
+async def submit_periodic_survey(
+    request: PeriodicSurveySubmitRequest,
+    user: dict = Depends(get_current_user),
+    survey_repo: SurveyHistoryRepository = Depends(get_survey_repo),
+):
+    """Submit khảo sát định kỳ (Job Resources + Six Areas)."""
+    user_id = user["uid"]
+    doc_id = survey_repo.save_periodic_survey(
+        user_id=user_id,
+        job_resources=request.job_resources,
+        six_areas=request.six_areas,
+    )
+    return {"id": doc_id, "status": "success", "message": "Periodic survey saved successfully"}
+
+
+@router.get("/periodic/latest")
+async def get_latest_periodic_survey(
+    user: dict = Depends(get_current_user),
+    survey_repo: SurveyHistoryRepository = Depends(get_survey_repo),
+):
+    """Lấy kết quả khảo sát định kỳ gần nhất."""
+    user_id = user["uid"]
+    result = survey_repo.get_latest_periodic_survey(user_id)
+    return result or {}
 
 
 @router.get("/{assessment_id}/survey", response_model=Optional[SurveyResponse])
@@ -308,49 +378,32 @@ async def submit_survey(
     Lưu survey data và chạy analysis ngay để có results khi xem lịch sử.
     """
     user_id = user["uid"]
+    survey_data = request.model_dump(exclude_none=True)
 
-    logger.info(
-        "submit_survey received: stress_level=%d, sleep=%s, work=%s, overtime=%s, deadline=%s",
-        request.stress_level, request.sleep_hours, request.working_hours,
-        request.overtime_hours, request.has_deadline
-    )
+    # Legacy field sync if provided
+    if "sleep_hours" in survey_data and "sleep_hour" not in survey_data:
+        survey_data["sleep_hour"] = survey_data["sleep_hours"]
+    if "working_hours" in survey_data and "working_hour" not in survey_data:
+        survey_data["working_hour"] = survey_data["working_hours"]
 
-    # Build survey data
-    survey_data = {
-        "sleep_hours": request.sleep_hours,
-        "working_hours": request.working_hours,
-        "overtime_hours": request.overtime_hours,
-        "has_deadline": request.has_deadline,
-        "work_days_per_week": request.work_days_per_week,
-        "stress_level": request.stress_level,
-        "motivation_level": request.motivation_level,
-    }
+    # Best-effort analysis for backward compatibility
+    analysis_result = None
+    try:
+        analysis_service = get_survey_analysis_service()
+        result = analysis_service.analyze(survey_data)
+        if result:
+            analysis_result = {
+                "risk_score": getattr(result, "risk_score", 0),
+                "risk_level": getattr(result, "risk_level", "low"),
+                "summary": getattr(result, "summary", ""),
+                "factors": [f.to_dict() for f in getattr(result, "factors", [])],
+                "recommendations": getattr(result, "recommendations", []),
+                "analysis_version": getattr(result, "analysis_version", "v2.0"),
+            }
+    except Exception as e:
+        logger.warning("Survey analysis fallback ignored: %s", e)
 
-    # Add optional fields if provided
-    if request.consecutive_work_days is not None:
-        survey_data["consecutive_work_days"] = request.consecutive_work_days
-    if request.rest_days is not None:
-        survey_data["rest_days"] = request.rest_days
-    if request.work_satisfaction is not None:
-        survey_data["work_satisfaction"] = request.work_satisfaction
-    if request.heart_rate is not None:
-        survey_data["heart_rate"] = request.heart_rate
-
-    # Analyze immediately to save with survey
-    analysis_service = get_survey_analysis_service()
-    result = analysis_service.analyze(survey_data)
-
-    # Build analysis result
-    analysis_result = {
-        "risk_score": result.risk_score,
-        "risk_level": result.risk_level,
-        "summary": result.summary,
-        "factors": [f.to_dict() for f in result.factors],
-        "recommendations": result.recommendations,
-        "analysis_version": result.analysis_version,
-    }
-
-    # Save survey with analysis result
+    # Save survey
     doc_id = survey_repo.save(
         assessment_id=assessment_id,
         user_id=user_id,
@@ -506,6 +559,28 @@ async def get_survey_history(
     return surveys
 
 
+@survey_standalone_router.get('/rolling-stats', response_model=RollingStatsResponse)
+async def get_rolling_stats(days: int = 7, user: dict = Depends(get_current_user)):
+    """Lấy thống kê trung bình trượt (rolling average) và trend của user."""
+    survey_repo = get_survey_history_repository()
+    surveys = survey_repo.get_recent_completed_surveys(user['uid'], limit=days * 2)
+    stats = SurveyAnalysisService.compute_rolling_stats(surveys, days=days)
+    stats['user_id'] = user['uid']
+    return stats
+
+
+@survey_standalone_router.get('/alerts', response_model=AlertsResponse)
+async def get_alerts(user: dict = Depends(get_current_user)):
+    """Lấy danh sách cảnh báo Allostatic Overload của user."""
+    survey_repo = get_survey_history_repository()
+    surveys = survey_repo.get_recent_completed_surveys(user['uid'], limit=7)
+    alerts = []
+    overload = SurveyAnalysisService.check_allostatic_overload(surveys)
+    if overload:
+        alerts.append(overload)
+    return {'alerts': alerts, 'has_critical': any(a.get('severity') == 'critical' for a in alerts)}
+
+
 @survey_standalone_router.get("/{survey_id}", response_model=dict)
 async def get_survey_detail(
     survey_id: str,
@@ -533,16 +608,15 @@ async def get_survey_detail(
 async def analyze_survey(
     request: AnalyzeRequest,
     user: dict = Depends(get_current_user),
+    survey_repo: SurveyHistoryRepository = Depends(get_survey_repo),
 ):
-    """Phân tích survey data và trả về kết quả.
+    """Phân tích survey data và trả về kết quả cá nhân hóa đa ngữ cảnh.
 
-    Backend chịu trách nhiệm tính toán risk_score, risk_level, factors, summary.
-
-    Flow:
-    1. Frontend submit survey data
-    2. Backend phân tích và trả về kết quả
-    3. Frontend chỉ render kết quả
+    Backend chịu trách nhiệm tính toán risk_score, risk_level, factors, summary và AI Qualitative Insight.
     """
+    rec_data = request.recovery or {}
+    quick_data = request.quick_overload_data or {}
+
     # Convert request to dict
     survey_data = {
         "sleep_hours": request.sleep_hours,
@@ -552,6 +626,12 @@ async def analyze_survey(
         "work_days_per_week": request.work_days_per_week,
         "stress_level": request.stress_level,
         "motivation_level": request.motivation_level,
+        "exhaustion": request.exhaustion,
+        "disengagement": request.disengagement,
+        "job_demands": request.job_demands,
+        "recovery": request.recovery,
+        "quick_overload_data": request.quick_overload_data,
+        "work_changes": request.work_changes,
     }
 
     # Add optional fields
@@ -568,6 +648,100 @@ async def analyze_survey(
     analysis_service = get_survey_analysis_service()
     result = analysis_service.analyze(survey_data)
 
+    # Load past survey history for temporal trend comparison
+    prev_comparison = "Đây là lần đầu tiên người dùng làm khảo sát."
+    trend_summary = "Chưa có đủ lịch sử khảo sát để so sánh xu hướng."
+    try:
+        recent_surveys = survey_repo.get_recent_completed_surveys(user["uid"], limit=5)
+        if recent_surveys:
+            prev_doc = recent_surveys[0]
+            prev_s = prev_doc.get("survey") or {}
+            prev_sleep = prev_s.get("sleep_hours")
+            prev_rec = (prev_s.get("recovery") or {}).get("recovery_score") if isinstance(prev_s.get("recovery"), dict) else prev_s.get("recovery_score")
+            prev_overload = (prev_s.get("quick_overload_data") or {}).get("rating") if isinstance(prev_s.get("quick_overload_data"), dict) else prev_s.get("quick_overload")
+
+            comparison_parts = []
+            if prev_sleep is not None:
+                comparison_parts.append(f"Giấc ngủ lần trước: {prev_sleep}h (lần này: {request.sleep_hours}h)")
+            if prev_rec is not None:
+                comparison_parts.append(f"Điểm phục hồi lần trước: {prev_rec}/5 (lần này: {rec_data.get('recovery_score', 3)}/5)")
+            if prev_overload is not None:
+                comparison_parts.append(f"Mức quá tải lần trước: {prev_overload}/5 (lần này: {quick_data.get('rating', 2)}/5)")
+
+            if comparison_parts:
+                prev_comparison = "So sánh với lần khảo sát trước: " + ", ".join(comparison_parts)
+
+            count = len(recent_surveys) + 1
+            trend_summary = f"Người dùng đã thực hiện tổng cộng {count} lần khảo sát. Dữ liệu xu hướng ghi nhận sự thay đổi thực tế qua từng lần check-in."
+    except Exception as e:
+        logger.warning("Failed to fetch historical survey trend: %s", e)
+
+    # Resolve Industry Context & Cross-Metric Archetype
+    job_title = None
+    industry_code = None
+    try:
+        from app.modules.user.services.user_profile_service import get_profile_service
+        p = get_profile_service().get_profile(user["uid"]) or {}
+        job_title = p.get("job_title")
+        industry_code = p.get("industry_code")
+    except Exception:
+        pass
+
+    from app.modules.burnout.helpers.industry_archetypes import resolve_industry_context
+    from app.modules.burnout.helpers.matrix_resolver import resolve_burnout_archetype
+
+    ind_ctx = resolve_industry_context(industry_code=industry_code, job_title=job_title)
+
+    ex_score = 3.0
+    if request.exhaustion:
+        vals = [float(v) for v in request.exhaustion.values() if v is not None]
+        if vals:
+            ex_score = sum(vals) / len(vals)
+    else:
+        ex_score = max(1.0, min(5.0, (request.stress_level or 5) / 2.0))
+
+    dis_score = 2.5
+    if request.disengagement:
+        vals = [float(v) for v in request.disengagement.values() if v is not None]
+        if vals:
+            dis_score = sum(vals) / len(vals)
+    else:
+        mot = float(request.motivation_level or 5)
+        dis_score = max(1.0, min(5.0, (11.0 - mot) / 2.0))
+
+    daily_stats = {
+        "job_demands": 3.0,
+        "sleep_hours": request.sleep_hours,
+        "recovery_score": rec_data.get("recovery_score", 3),
+        "quick_overload": quick_data.get("rating", 2),
+        "overload_reasons": quick_data.get("reasons", []),
+        "overtime_hours": request.overtime_hours or 0.0,
+    }
+    archetype = resolve_burnout_archetype(ex_score, dis_score, daily_stats)
+
+    evidence = {
+        "exhaustion_level": result.risk_level,
+        "disengagement_level": result.risk_level,
+        "sleep_hours": request.sleep_hours,
+        "recovery_score": rec_data.get("recovery_score", 3),
+        "quick_overload": quick_data.get("rating", 2),
+        "overload_reasons": quick_data.get("reasons", []),
+        "other_reason": quick_data.get("other_reason", ""),
+        "previous_comparison": prev_comparison,
+        "trend_summary": trend_summary,
+        # Industry & Archetype context
+        "job_title": job_title or ind_ctx.typical_roles[0],
+        "industry_name": ind_ctx.name,
+        "industry_icon": ind_ctx.icon,
+        "vocabulary_hints": ind_ctx.vocabulary_hints,
+        "stressors_context": ind_ctx.stressors_context,
+        "reflection_theme": ind_ctx.reflection_theme,
+        "archetype_name": f"{archetype.icon} {archetype.name}",
+        "empathy_direction": archetype.empathy_direction,
+        "ai_prompt_instruction": archetype.ai_prompt_instruction,
+    }
+    ai_insight_result = get_survey_ai_interpreter().generate_insight(evidence)
+
     logger.info(
         "Survey analyzed for user %s: risk_score=%.1f, risk_level=%s",
         user["uid"],
@@ -582,6 +756,7 @@ async def analyze_survey(
         factors=[AnalysisFactorResponse(**f.to_dict()) for f in result.factors],
         recommendations=[RecommendationResponse(**r) for r in result.recommendations],
         analysis_version=result.analysis_version,
+        ai_insight=AIInsightResponse(**ai_insight_result.to_dict()),
     )
 
 
@@ -671,3 +846,4 @@ async def get_recommendations(
     except Exception as e:
         logger.error("Failed to search places: %s", e)
         raise HTTPException(status_code=500, detail="Failed to search places")
+

@@ -185,6 +185,56 @@ class UserRepository:
             {"updated_at": datetime.utcnow()}
         )
 
+    def sync_firebase_user(
+        self,
+        uid: str,
+        email: Optional[str] = None,
+        full_name: Optional[str] = None,
+        picture: Optional[str] = None,
+        email_verified: bool = False,
+        role: Optional[str] = None,
+    ) -> User:
+        """Đồng bộ hoặc tạo mới user từ Firebase Auth vào Firestore."""
+        doc_ref = self.collection.document(uid)
+        doc = doc_ref.get()
+        now = datetime.utcnow()
+
+        if doc.exists:
+            data = doc.to_dict()
+            updates = {"last_login_at": now, "updated_at": now}
+            if email and not data.get("email"):
+                updates["email"] = email.lower()
+            if full_name and not data.get("full_name"):
+                updates["full_name"] = full_name
+            if picture and not data.get("avatar_url"):
+                updates["avatar_url"] = picture
+            if email_verified != data.get("email_verified"):
+                updates["email_verified"] = email_verified
+            if role and role != data.get("role"):
+                updates["role"] = role
+            doc_ref.update(updates)
+            return self.get_by_id(uid)
+        else:
+            username = email.split("@")[0].lower() if email else f"user_{uid[:8]}"
+            user_data = {
+                "username": username,
+                "email": email.lower() if email else None,
+                "password_hash": "",
+                "full_name": full_name or username,
+                "phone": None,
+                "avatar_url": picture,
+                "role": role or "user",
+                "is_active": True,
+                "email_verified": email_verified,
+                "created_at": now,
+                "updated_at": now,
+                "last_login_at": now,
+            }
+            doc_ref.set(user_data)
+            logger.info("Created Firestore user from Firebase Auth: %s (%s)", uid, email)
+            return self.get_by_id(uid)
+
+
 
 # ==========================================
 # Singleton

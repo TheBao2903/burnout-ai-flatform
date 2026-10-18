@@ -36,6 +36,7 @@ class SurveyHistoryRepository:
     def __init__(self):
         self.db = get_firebase().db
         self.collection = self.db.collection(FirestoreCollections.SURVEY_HISTORY)
+        self.periodic_collection = self.db.collection(FirestoreCollections.PERIODIC_SURVEYS)
 
     def save(
         self,
@@ -157,6 +158,27 @@ class SurveyHistoryRepository:
             results.append(data)
 
         # Sort bằng Python theo completed_at DESC
+        def get_sort_key(item):
+            ts = item.get("completed_at")
+            if ts is None:
+                ts = item.get("created_at")
+            if isinstance(ts, datetime):
+                return ts
+            return datetime.min
+
+        results.sort(key=get_sort_key, reverse=True)
+        return results[:limit]
+
+    def get_recent_completed_surveys(self, user_id: str, limit: int = 14) -> List[Dict[str, Any]]:
+        """Lấy các survey completed gần đây nhất của user."""
+        query = self.collection.where("user_id", "==", user_id).limit(limit * 3)
+        results = []
+        for doc in query.stream():
+            data = doc.to_dict() or {}
+            data["id"] = doc.id
+            if data.get("status") == "completed":
+                results.append(data)
+                
         def get_sort_key(item):
             ts = item.get("completed_at")
             if ts is None:
@@ -381,6 +403,44 @@ class SurveyHistoryRepository:
             return None
 
         return round(sum(stress_levels) / len(stress_levels), 1)
+
+    def save_periodic_survey(
+        self,
+        user_id: str,
+        job_resources: Dict[str, Any],
+        six_areas: Dict[str, Any],
+    ) -> str:
+        """Lưu kết quả khảo sát định kỳ (Job Resources & Six Areas of Worklife)."""
+        data = {
+            "user_id": user_id,
+            "job_resources": job_resources,
+            "six_areas": six_areas,
+            "submitted_at": firestore.SERVER_TIMESTAMP,
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+        doc_ref = self.periodic_collection.document()
+        doc_ref.set(data)
+        logger.info("Saved periodic survey %s for user %s", doc_ref.id, user_id)
+        return doc_ref.id
+
+    def get_latest_periodic_survey(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Lấy kết quả khảo sát định kỳ mới nhất của user."""
+        try:
+            docs = (
+                self.periodic_collection
+                .where("user_id", "==", user_id)
+                .order_by("submitted_at", direction=firestore.Query.DESCENDING)
+                .limit(1)
+                .stream()
+            )
+            for doc in docs:
+                d = doc.to_dict()
+                d["id"] = doc.id
+                return d
+        except Exception as e:
+            logger.warning("Failed to query latest periodic survey for %s: %s", user_id, e)
+        return None
 
 
 # ==========================================

@@ -17,6 +17,7 @@ Analysis bao gồm:
 """
 
 import logging
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("burnout.survey.analysis")
@@ -274,11 +275,19 @@ class SurveyAnalysisService:
         Returns:
             SurveyAnalysisResult với risk_score, risk_level, factors, summary
         """
-        # Extract values with defaults
-        sleep_hours = survey_data.get("sleep_hours", 7)
+        # Extract STA values if provided
+        exhaustion = survey_data.get("exhaustion") or {}
+        disengagement = survey_data.get("disengagement") or {}
+        job_demands = survey_data.get("job_demands") or {}
+        recovery = survey_data.get("recovery") or {}
+        quick_overload_data = survey_data.get("quick_overload_data") or {}
+        work_changes = survey_data.get("work_changes") or {}
+
+        # Extract values with defaults (prioritize STA structured inputs)
+        sleep_hours = recovery.get("sleep_hours", survey_data.get("sleep_hours", 7))
         working_hours = survey_data.get("working_hours", 8)
-        overtime_hours = survey_data.get("overtime_hours", 0)
-        has_deadline = survey_data.get("has_deadline", "low")
+        overtime_hours = work_changes.get("overtime_hours", survey_data.get("overtime_hours", 0))
+        has_deadline = work_changes.get("has_deadline", survey_data.get("has_deadline", "low"))
         work_days_per_week = survey_data.get("work_days_per_week", 5)
         stress_level = survey_data.get("stress_level", 5)
         motivation_level = survey_data.get("motivation_level", 5)
@@ -291,6 +300,79 @@ class SurveyAnalysisService:
         factors: List[AnalysisFactor] = []
         total_weighted_score = 0.0
         total_weight = 0.0
+
+        # --- STA Dimension Evaluation (OLBI Core & JD-R) ---
+        e_vals = [float(v) for k, v in exhaustion.items() if isinstance(v, (int, float))]
+        if e_vals:
+            mean_e = sum(e_vals) / len(e_vals)
+            e_score = ((mean_e - 1.0) / 4.0) * 100.0
+            if e_score >= 40:
+                factors.append(AnalysisFactor(
+                    code="EXHAUSTION",
+                    score=e_score,
+                    severity="high" if e_score >= 70 else "medium",
+                    title="Mức độ Kiệt sức cao (OLBI Exhaustion)",
+                    description="Cảm giác mệt mỏi và cạn kiệt năng lượng sau khi làm việc ở mức đáng chú ý.",
+                ))
+            total_weighted_score += e_score * 30
+            total_weight += 30
+
+        d_vals = [float(v) for k, v in disengagement.items() if isinstance(v, (int, float))]
+        if d_vals:
+            mean_d = sum(d_vals) / len(d_vals)
+            d_score = ((mean_d - 1.0) / 4.0) * 100.0
+            if d_score >= 40:
+                factors.append(AnalysisFactor(
+                    code="DISENGAGEMENT",
+                    score=d_score,
+                    severity="high" if d_score >= 70 else "medium",
+                    title="Suy giảm gắn kết (OLBI Disengagement)",
+                    description="Cảm xúc gắn kết và ý nghĩa công việc đang có dấu hiệu giảm sút.",
+                ))
+            total_weighted_score += d_score * 30
+            total_weight += 30
+
+        jd_vals = [float(v) for k, v in job_demands.items() if isinstance(v, (int, float))]
+        if jd_vals:
+            mean_jd = sum(jd_vals) / len(jd_vals)
+            jd_score = ((mean_jd - 1.0) / 4.0) * 100.0
+            if jd_score >= 40:
+                factors.append(AnalysisFactor(
+                    code="JOB_DEMANDS",
+                    score=jd_score,
+                    severity="high" if jd_score >= 70 else "medium",
+                    title="Áp lực công việc cao (Job Demands)",
+                    description="Khối lượng công việc và áp lực thời gian gấp đang ở mức cao.",
+                ))
+            total_weighted_score += jd_score * 20
+            total_weight += 20
+
+        if recovery.get("recovery_score") is not None:
+            rec_val = float(recovery["recovery_score"])
+            rec_score = ((5.0 - rec_val) / 4.0) * 100.0
+            if rec_val <= 2:
+                factors.append(AnalysisFactor(
+                    code="POOR_RECOVERY",
+                    score=rec_score,
+                    severity="high" if rec_val == 1 else "medium",
+                    title="Khả năng phục hồi kém",
+                    description="Thời gian nghỉ ngơi chưa giúp bạn tái tạo đủ năng lượng cho công việc.",
+                ))
+            total_weighted_score += rec_score * 20
+            total_weight += 20
+
+        if quick_overload_data.get("overload_rating") is not None:
+            ol_val = float(quick_overload_data["overload_rating"])
+            if ol_val >= 4:
+                reasons = quick_overload_data.get("reasons", [])
+                reason_str = ", ".join(reasons) if reasons else "áp lực dồn nén"
+                factors.append(AnalysisFactor(
+                    code="WORK_OVERLOAD",
+                    score=ol_val * 20.0,
+                    severity="high",
+                    title="Cảm giác quá tải công việc",
+                    description=f"Đang cảm thấy quá tải: {reason_str}.",
+                ))
 
         # SLEEP_DEPRIVATION
         if sleep_hours < 6:
@@ -525,6 +607,133 @@ class SurveyAnalysisService:
             factors=factors,
             recommendations=recommendations,
         )
+
+    @staticmethod
+    def compute_rolling_stats(surveys: List[Dict], days: int = 7) -> Dict:
+        """Compute rolling stats and trends."""
+        stats = {
+            'period_days': days,
+            'total_surveys': len(surveys),
+            'dimensions': {
+                'exhaustion': {'current': None, 'average': None, 'trend': 'stable', 'values': []},
+                'disengagement': {'current': None, 'average': None, 'trend': 'stable', 'values': []},
+                'job_demands': {'current': None, 'average': None, 'trend': 'stable', 'values': []},
+                'recovery': {'current': None, 'average': None, 'trend': 'stable', 'values': []},
+                'sleep': {'current': None, 'average': None, 'trend': 'stable', 'values': []}
+            },
+            'overall_trend': 'stable',
+            'computed_at': datetime.utcnow().isoformat()
+        }
+        if not surveys:
+            return stats
+
+        dim_vals = {'exhaustion': [], 'disengagement': [], 'job_demands': [], 'recovery': [], 'sleep': []}
+
+        for record in surveys:
+            s_data = record.get('survey', {})
+            # Exhaustion
+            exh = s_data.get('exhaustion', {})
+            e_vals = [float(exh[k]) for k in ['e1', 'e2', 'e3'] if k in exh and exh[k] is not None]
+            if e_vals:
+                dim_vals['exhaustion'].append(sum(e_vals) / len(e_vals))
+            
+            # Disengagement
+            dis = s_data.get('disengagement', {})
+            if 'd1' in dis and dis['d1'] is not None:
+                dim_vals['disengagement'].append(float(dis['d1']))
+                
+            # Job Demands
+            jd = s_data.get('job_demands', {})
+            jd_vals = [float(jd[k]) for k in ['jd1', 'jd2'] if k in jd and jd[k] is not None]
+            if jd_vals:
+                dim_vals['job_demands'].append(sum(jd_vals) / len(jd_vals))
+                
+            # Recovery
+            rec = s_data.get('recovery', {})
+            if rec.get('recovery_score') is not None:
+                dim_vals['recovery'].append(float(rec['recovery_score']))
+            elif s_data.get('recovery_score') is not None:
+                dim_vals['recovery'].append(float(s_data['recovery_score']))
+                
+            # Sleep
+            if rec.get('sleep_hours') is not None:
+                dim_vals['sleep'].append(float(rec['sleep_hours']))
+            elif s_data.get('sleep_hours') is not None:
+                dim_vals['sleep'].append(float(s_data['sleep_hours']))
+
+        for key, vals in dim_vals.items():
+            if not vals:
+                continue
+            avg = sum(vals) / len(vals)
+            curr = vals[0]
+            trend = 'stable'
+            
+            last_3 = vals[:3]
+            prev_4 = vals[3:7]
+            if len(last_3) > 0 and len(prev_4) > 0:
+                avg_last_3 = sum(last_3) / len(last_3)
+                avg_prev_4 = sum(prev_4) / len(prev_4)
+                diff = avg_last_3 - avg_prev_4
+                if diff > 0.3:
+                    trend = 'increasing'
+                elif diff < -0.3:
+                    trend = 'decreasing'
+                    
+            stats['dimensions'][key] = {
+                'current': round(curr, 2),
+                'average': round(avg, 2),
+                'trend': trend,
+                'values': [round(v, 2) for v in vals]
+            }
+            
+        return stats
+
+    @staticmethod
+    def check_allostatic_overload(surveys: List[Dict]) -> Optional[Dict]:
+        """Check for continuous allostatic overload based on recent surveys."""
+        if len(surveys) < 3:
+            return None
+            
+        recent_3 = surveys[:3]
+        exh_vals = []
+        sleep_vals = []
+        
+        for record in recent_3:
+            s_data = record.get('survey', {})
+            
+            # Exhaustion
+            exh = s_data.get('exhaustion', {})
+            e_vals = [float(exh[k]) for k in ['e1', 'e2', 'e3'] if k in exh and exh[k] is not None]
+            if e_vals:
+                exh_vals.append(sum(e_vals) / len(e_vals))
+                
+            # Sleep
+            rec = s_data.get('recovery', {})
+            sleep = None
+            if rec.get('sleep_hours') is not None:
+                sleep = float(rec['sleep_hours'])
+            elif s_data.get('sleep_hours') is not None:
+                sleep = float(s_data['sleep_hours'])
+            if sleep is not None:
+                sleep_vals.append(sleep)
+                
+        if len(exh_vals) == 3 and len(sleep_vals) == 3:
+            exh_mean = sum(exh_vals) / 3
+            sleep_mean = sum(sleep_vals) / 3
+            
+            if all(v >= 4.0 for v in exh_vals) and all(v < 6.0 for v in sleep_vals):
+                return {
+                    'type': 'allostatic_overload',
+                    'severity': 'critical',
+                    'title': 'Cảnh báo quá tải kéo dài',
+                    'message': 'Bạn đang trong trạng thái kiệt sức kéo dài với giấc ngủ không đủ. Hãy ưu tiên nghỉ ngơi và tìm kiếm hỗ trợ.',
+                    'consecutive_days': 3,
+                    'details': {
+                        'avg_exhaustion': round(exh_mean, 2),
+                        'avg_sleep': round(sleep_mean, 2)
+                    }
+                }
+        return None
 
 
 # ==========================================

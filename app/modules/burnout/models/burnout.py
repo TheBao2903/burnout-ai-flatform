@@ -2,55 +2,47 @@
 ==============================================================
 File: burnout.py
 
-Burnout Models - Kết quả đánh giá Burnout.
+Burnout Models - Kết quả đánh giá Burnout theo chuẩn khoa học (STA).
 
-CLEAN ARCHITECTURE - Theo thiết kế:
-- BurnoutEngine là nơi DUY NHẤT tính burnout_score
-- KHÔNG có risk_score (dùng burnout_score)
-- Thêm engine_version để track algorithm
-- Thêm confidence (tách khỏi score)
-- Recommendation structure phân biệt type
-
-Updated:
-- Issue #5: Missing data handling
-- Clean architecture: Survey chỉ lưu raw answers
+MÔ HÌNH THIẾT KẾ (STA):
+- Burnout Core: Exhaustion + Disengagement (OLBI) thang 1-5
+- Context: Job Demands + Job Resources (JD-R) + Six Areas + Recovery
+- Supporting Signals: AI Chat (context tags) + DeepFace Facial Emotion
+- Data Sufficiency & Data Quality: Thay thế trọng số data completeness tùy tiện
+- Confidence: Mặc định null vì chưa có kiểm định lâm sàng
+- Tương thích ngược: Duy trì burnout_score, risk_level, factors, insight cho các API cũ
 ==============================================================
 """
 
 from datetime import datetime
-from typing import Any, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ==========================================
-# Factor Models
+# Legacy / Factor Models
 # ==========================================
 
 class BurnoutFactor(BaseModel):
-    """Một yếu tố ảnh hưởng đến Burnout."""
+    """Một yếu tố ảnh hưởng đến Burnout (Legacy support)."""
 
-    model_config = ConfigDict(
-        from_attributes=True,
-        json_schema_extra={
-            "example": {
-                "factor": "sleep",
-                "score": 95.0,
-                "weight": 0.30,
-                "contribution": 28.5,
-                "details": {
-                    "sleep_hours": 4.5,
-                    "label": "Thiếu ngủ"
-                }
-            }
-        }
-    )
+    model_config = ConfigDict(from_attributes=True, extra="allow")
 
     factor: str = Field(..., description="Tên factor: sleep, workload, stress, emotion, behavior")
-    score: float = Field(..., ge=0.0, le=100.0, description="Điểm số của factor (0-100)")
-    weight: float = Field(..., ge=0.0, le=1.0, description="Trọng số gốc của factor")
-    contribution: float = Field(..., ge=0.0, le=100.0, description="Đóng góp vào burnout_score (%)")
-    details: Optional[dict] = Field(default=None, description="Chi tiết bổ sung")
+    score: float = Field(default=0.0, ge=0.0, le=100.0, description="Điểm số của factor (0-100)")
+    weight: float = Field(default=0.0, ge=0.0, le=1.0, description="Trọng số gốc của factor")
+    contribution: float = Field(default=0.0, ge=0.0, le=100.0, description="Đóng góp vào burnout_score (%)")
+    percentage: float = Field(default=0.0, description="Alias cho contribution")
+    details: Optional[dict] = Field(default_factory=dict, description="Chi tiết bổ sung")
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.percentage and not self.contribution:
+            self.contribution = self.percentage
+        elif self.contribution and not self.percentage:
+            self.percentage = self.contribution
+        if self.details and "sub_score" in self.details and not self.score:
+            self.score = float(self.details["sub_score"])
 
 
 # ==========================================
@@ -58,126 +50,121 @@ class BurnoutFactor(BaseModel):
 # ==========================================
 
 class Recommendation(BaseModel):
-    """Một recommendation cho user.
+    """Gợi ý cải thiện cho người dùng."""
 
-    Phân biệt:
-    - type: behavior, place, professional_support, etc.
-    - Place recommendation chỉ lưu tối thiểu (place_id, name, category, distance)
-    - Full place data lấy từ Place Service khi cần
-    """
+    model_config = ConfigDict(from_attributes=True)
 
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "id": "rec_001",
-                "type": "behavior",
-                "priority": "high",
-                "title": "Cải thiện giấc ngủ",
-                "description": "Ngủ đủ 7-8 tiếng mỗi đêm để phục hồi năng lượng",
-                "reason": "Sleep score cao (90/100) - Thiếu ngủ nghiêm trọng",
-                "action": "Đặt báo thức sớm hơn 1 tiếng, tránh màn hình trước khi ngủ",
-                "target_factor": "sleep",
-                "metadata": {}
-            }
-        }
+    type: Literal["immediate", "short_term", "long_term", "medical", "lifestyle", "workplace", "behavior", "activity"] = Field(
+        default="behavior",
+        description="Phân loại gợi ý"
     )
-
-    id: str = Field(default="", description="Recommendation ID")
-    type: Literal["behavior", "place", "professional_support", "lifestyle"] = Field(
-        ..., description="Loại recommendation"
+    priority: Literal["low", "medium", "high", "urgent"] = Field(
+        default="medium",
+        description="Mức độ ưu tiên"
     )
-    priority: Literal["high", "medium", "low"] = Field(
-        ..., description="Độ ưu tiên"
-    )
-    title: str = Field(..., description="Tiêu đề")
-    description: str = Field(..., description="Mô tả chi tiết")
-    reason: Optional[str] = Field(
-        default=None, description="Lý do đề xuất (dựa trên factor nào)"
-    )
-    action: Optional[str] = Field(
-        default=None, description="Hành động cụ thể user nên làm"
-    )
-    target_factor: Optional[str] = Field(
-        default=None, description="Factor mà recommendation này nhắm đến"
-    )
-
-    # Place-specific fields (optional, chỉ khi type="place")
-    place_id: Optional[str] = Field(
-        default=None, description="Place ID (nếu type=place)"
-    )
-    name: Optional[str] = Field(
-        default=None, description="Tên địa điểm (snapshot)"
-    )
-    category: Optional[str] = Field(
-        default=None, description="Loại: park, cafe, gym..."
-    )
-    distance_meters: Optional[int] = Field(
-        default=None, description="Khoảng cách tại thời điểm recommend (m)"
-    )
-
-    # Generic metadata
-    metadata: dict = Field(default_factory=dict, description="Metadata bổ sung")
+    title: str = Field(..., description="Tiêu đề gợi ý ngắn gọn")
+    description: str = Field(..., description="Nội dung chi tiết và hành động cụ thể")
+    reason: Optional[str] = Field(default=None, description="Lý do đưa ra gợi ý")
+    target_factor: Optional[str] = Field(default=None, description="Factor cần cải thiện")
+    place_id: Optional[str] = Field(default=None, description="Place ID nếu là gợi ý địa điểm")
+    metadata: Optional[dict] = Field(default=None, description="Metadata bổ sung")
 
 
 # ==========================================
-# Insight Models
+# STA Scientific Architecture Sub-models
+# ==========================================
+
+class DimensionDetail(BaseModel):
+    """Chi tiết một khía cạnh (Likert 1-5)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    score: Optional[float] = Field(default=None, description="Điểm trung bình (1.00 - 5.00)")
+    level: str = Field(default="insufficient_data", description="Mức độ: low, medium, high, insufficient_data")
+    trend: str = Field(default="stable", description="Diễn biến: increasing, stable, decreasing, insufficient_data")
+    indicator: str = Field(default="→", description="Ký hiệu hiển thị: ↑, →, ↓")
+
+
+class BurnoutCoreResult(BaseModel):
+    """Burnout Core theo OLBI: Exhaustion + Disengagement."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    exhaustion: DimensionDetail = Field(default_factory=DimensionDetail, description="Chỉ số Kiệt sức")
+    disengagement: DimensionDetail = Field(default_factory=DimensionDetail, description="Chỉ số Xa cách công việc")
+    status: str = Field(
+        default="Tín hiệu burnout ổn định ở mức thấp",
+        description="Trạng thái tín hiệu tổng quát"
+    )
+
+
+class RecoveryResult(BaseModel):
+    """Khả năng hồi phục: Đối chiếu thời lượng ngủ và cảm nhận hồi phục."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    sleep_hours: Optional[float] = Field(default=None, description="Số giờ ngủ đêm qua")
+    recovery_perception: Optional[float] = Field(default=None, description="Cảm nhận hồi phục (1-5)")
+    status: str = Field(default="medium", description="Mức độ hồi phục: low, medium, good, insufficient_data")
+    description: str = Field(default="", description="Mô tả bối cảnh hồi phục")
+
+
+class ContextResult(BaseModel):
+    """Bối cảnh công việc và hồi phục (JD-R, Six Areas, Recovery)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    job_demands: DimensionDetail = Field(default_factory=DimensionDetail, description="Yêu cầu công việc (JD-R)")
+    job_resources: DimensionDetail = Field(default_factory=DimensionDetail, description="Nguồn lực công việc (JD-R)")
+    worklife_areas: Dict[str, Optional[float]] = Field(
+        default_factory=dict,
+        description="Six Areas of Worklife: workload, control, reward, community, fairness, values"
+    )
+    recovery: RecoveryResult = Field(default_factory=RecoveryResult, description="Khả năng hồi phục")
+    overload_signals: Optional[Dict[str, Any]] = Field(default=None, description="Tín hiệu quá tải nhanh")
+
+
+class SupportingSignalsResult(BaseModel):
+    """Tín hiệu hỗ trợ từ AI Chat & DeepFace."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    chat: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Context tags từ AI Chat (workload, deadline, lack of support...)"
+    )
+    facial: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Phân bố cảm xúc từ DeepFace (dominant emotion, negative ratio)"
+    )
+
+
+# ==========================================
+# Insight Model
 # ==========================================
 
 class BurnoutInsight(BaseModel):
-    """Insight từ burnout analysis."""
+    """Tóm tắt phân tích định tính."""
 
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "assessment_id": "asm_abc123",
-                "user_id": "user_123",
-                "primary_factor": "sleep",
-                "secondary_factor": "workload",
-                "key_observations": [
-                    "Ngủ trung bình chỉ 4.5 tiếng/đêm",
-                    "Làm việc 12 tiếng/ngày"
-                ],
-                "summary": "Nguy cơ burnout ở mức cao. Thiếu ngủ và quá tải công việc là hai vấn đề chính.",
-                "data_completeness": 0.85,
-                "evidence_coverage": 0.75,
-                "available_factors": ["sleep", "workload", "stress"],
-                "missing_factors": ["emotion", "behavior"]
-            }
-        }
-    )
+    model_config = ConfigDict(from_attributes=True, extra="allow")
 
-    assessment_id: str = Field(..., description="Assessment ID")
-    user_id: str = Field(..., description="User ID")
+    session_id: Optional[str] = None
+    assessment_id: Optional[str] = None
+    user_id: Optional[str] = None
+    primary_factor: Optional[str] = None
+    secondary_factor: Optional[str] = None
+    key_observations: List[str] = Field(default_factory=list)
+    summary: str = ""
+    data_completeness: float = 1.0
+    evidence_coverage: float = 1.0
+    available_factors: List[str] = Field(default_factory=list)
+    missing_factors: List[str] = Field(default_factory=list)
 
-    # Factor analysis
-    primary_factor: Optional[str] = Field(
-        default=None, description="Factor đóng góp cao nhất"
-    )
-    secondary_factor: Optional[str] = Field(
-        default=None, description="Factor đóng góp cao thứ 2"
-    )
-    key_observations: List[str] = Field(
-        default_factory=list, description="Các quan sát chính"
-    )
+    def __getitem__(self, item: str) -> Any:
+        return getattr(self, item, None)
 
-    # Summary
-    summary: str = Field(..., description="Tóm tắt tình trạng")
-
-    # Evidence
-    data_completeness: float = Field(
-        ..., ge=0.0, le=1.0,
-        description="Mức độ hoàn thiện dữ liệu (0-1)"
-    )
-    evidence_coverage: float = Field(
-        ..., ge=0.0, le=1.0,
-        description="Tỷ lệ evidence có sẵn so với tổng (0-1)"
-    )
-    available_factors: List[str] = Field(
-        default_factory=list, description="Các factors có dữ liệu"
-    )
-    missing_factors: List[str] = Field(
-        default_factory=list, description="Các factors thiếu dữ liệu"
-    )
+    def get(self, item: str, default: Any = None) -> Any:
+        return getattr(self, item, default)
 
 
 # ==========================================
@@ -185,198 +172,95 @@ class BurnoutInsight(BaseModel):
 # ==========================================
 
 class BurnoutResult(BaseModel):
-    """Kết quả đánh giá Burnout CUỐI CÙNG.
+    """Kết quả đánh giá Burnout theo mô hình STA."""
 
-    ĐÂY LÀ NƠI DUY NHẤT LƯU:
-    - burnout_score (KHÔNG có risk_score riêng)
-    - risk_level (từ burnout_score)
-    - factors (từ BurnoutEngine)
-    - data_completeness (evidence coverage)
-    - confidence (AI confidence, tách khỏi score)
-    - insight (AI summary + observations)
-    - recommendations (từ RecommendationEngine)
-    - engine_version (để track algorithm changes)
-    """
+    model_config = ConfigDict(from_attributes=True, extra="allow")
 
-    model_config = ConfigDict(
-        from_attributes=True,
-        json_schema_extra={
-            "example": {
-                "id": "burnout_result_001",
-                "assessment_id": "asm_xyz789",
-                "user_id": "user_123",
-                "engine_version": "v2.1",
-                "burnout_score": 72.5,
-                "risk_level": "high",
-                "confidence": 0.85,
-                "data_completeness": 0.92,
-                "trend": "increasing",
-                "factors": [
-                    {
-                        "factor": "sleep",
-                        "score": 95.0,
-                        "weight": 0.30,
-                        "contribution": 28.5,
-                        "details": {"sleep_hours": 4.5, "label": "Thiếu ngủ"}
-                    },
-                    {
-                        "factor": "workload",
-                        "score": 75.0,
-                        "weight": 0.25,
-                        "contribution": 18.75,
-                        "details": {"working_hours": 11.0, "label": "Công việc quá tải"}
-                    }
-                ],
-                "insight": {
-                    "primary_factor": "sleep",
-                    "secondary_factor": "workload",
-                    "key_observations": [
-                        "Ngủ trung bình chỉ 4.5 tiếng/đêm",
-                        "Làm việc 11 tiếng/ngày"
-                    ],
-                    "summary": "Nguy cơ burnout ở mức cao. Thiếu ngủ và quá tải công việc là hai vấn đề chính."
-                },
-                "recommendations": [
-                    {
-                        "type": "behavior",
-                        "priority": "high",
-                        "title": "Cải thiện giấc ngủ",
-                        "description": "Ngủ đủ 7-8 tiếng mỗi đêm",
-                        "reason": "Sleep score cao (95/100)",
-                        "target_factor": "sleep"
-                    }
-                ],
-                "analyzed_at": "2024-01-20T10:15:00Z",
-                "created_at": "2024-01-20T10:15:00Z"
-            }
-        }
-    )
+    id: str = Field(default="", description="Document ID")
+    assessment_id: str = Field(default="test", description="FK -> assessment session")
+    user_id: str = Field(default="test", description="User ID")
+    engine_version: str = Field(default="v2.5_sta", description="Phiên bản thuật toán")
 
-    # IDs
-    id: str = Field(default="", description="Document ID (auto)")
-    assessment_id: str = Field(..., description="FK -> assessment session")
-    user_id: str = Field(..., description="User ID (denormalized)")
+    # STA Output Fields
+    burnout_core: BurnoutCoreResult = Field(default_factory=BurnoutCoreResult)
+    context: ContextResult = Field(default_factory=ContextResult)
+    supporting_signals: SupportingSignalsResult = Field(default_factory=SupportingSignalsResult)
+    data_quality: str = Field(default="valid", description="Chất lượng dữ liệu: valid, partial, invalid")
+    data_sufficiency: str = Field(default="sufficient", description="Độ đủ dữ liệu: sufficient, insufficient_data")
+    interpretation: str = Field(default="", description="Nhận định khoa học tổng hợp")
 
-    # Engine metadata
-    engine_version: str = Field(
-        default="v2.1",
-        description="Phiên bản BurnoutEngine sử dụng"
-    )
+    # Confidence (Item 15: null nếu chưa kiểm định)
+    confidence: Optional[float] = Field(default=None, description="Độ tin cậy kiểm định lâm sàng")
 
-    # Core scores
-    burnout_score: float = Field(
-        ..., ge=0.0, le=100.0,
-        description="Điểm burnout (0-100). ĐÂY LÀ ĐIỂM SỐ CHÍNH - KHÔNG dùng risk_score"
-    )
-    risk_level: Literal["low", "medium", "high", "critical", "insufficient_data"] = Field(
-        ...,
-        description="Mức độ rủi ro: low(<40), medium(40-59), high(60-79), critical(>=80), insufficient_data(không đủ dữ liệu)"
-    )
+    # Recommendations (Accepts Recommendation objects or legacy string lists)
+    recommendations: List[Any] = Field(default_factory=list)
 
-    # Confidence & Completeness (TÁCH BIỆT)
-    confidence: float = Field(
-        default=1.0, ge=0.0, le=1.0,
-        description="Độ tin cậy của kết quả (từ AI/emotion confidence). KHÔNG phải data_completeness"
-    )
-    data_completeness: float = Field(
-        default=0.0, ge=0.0, le=1.0,
-        description="Mức độ hoàn thiện của evidence (0-1). Đây là evidence coverage"
-    )
-
-    # Trend
-    trend: Literal["increasing", "decreasing", "stable", "insufficient_data"] = Field(
-        default="insufficient_data",
-        description="Xu hướng so với các lần đánh giá trước"
-    )
-
-    # Factors breakdown
-    factors: List[BurnoutFactor] = Field(
-        default_factory=list,
-        description="Danh sách factors với scores và contributions"
-    )
-
-    # Insight (AI-generated summary)
-    insight: Optional[BurnoutInsight] = Field(
-        default=None,
-        description="Insight chi tiết từ burnout analysis"
-    )
-
-    # Recommendations (từ RecommendationEngine)
-    recommendations: List[Recommendation] = Field(
-        default_factory=list,
-        description="Danh sách recommendations"
-    )
-
-    # Disclaimer
+    # Disclaimer (Item 16: Không phán 'Bạn bị burnout', chỉ là tín hiệu hệ thống mẫu)
     disclaimer: str = Field(
-        default="Chỉ số AI không thay thế chẩn đoán y khoa. Nếu cảm thấy quá tải hay tự sát, hãy gặp chuyên gia.",
-        description="Tuyên bố từ chối trách nhiệm"
+        default="Chỉ số AI không thay thế chẩn đoán y khoa. Đây là kết quả nghiên cứu/nguyên mẫu hệ thống nhằm hỗ trợ tự theo dõi."
     )
 
-    # Timestamps
-    analyzed_at: datetime = Field(
-        default_factory=datetime.utcnow,
-        description="Thời điểm phân tích"
-    )
-    created_at: datetime = Field(
-        default_factory=datetime.utcnow,
-        description="Thời điểm tạo record"
-    )
+    # Backward compatibility fields (cho các API/màn hình admin cũ)
+    burnout_score: float = Field(default=0.0, description="Điểm quy đổi tham khảo (0-100)")
+    risk_level: str = Field(default="low", description="Mức độ: low, medium, high, critical, insufficient_data")
+    data_completeness: float = Field(default=1.0)
+    trend: str = Field(default="stable")
+    factors: List[BurnoutFactor] = Field(default_factory=list)
+    insight: Optional[BurnoutInsight] = None
 
-    # ==========================================
-    # Computed Properties
-    # ==========================================
-
-    def get_primary_factor(self) -> Optional[str]:
-        """Lấy factor đóng góp cao nhất."""
-        if not self.factors:
-            return None
-        return max(self.factors, key=lambda f: f.contribution).factor
+    analyzed_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 
     def get_top_recommendations(self, limit: int = 3) -> List[Recommendation]:
         """Lấy top N recommendations theo priority."""
-        priority_order = {"high": 0, "medium": 1, "low": 2}
-        sorted_recs = sorted(
-            self.recommendations,
-            key=lambda r: priority_order.get(r.priority, 3)
-        )
-        return sorted_recs[:limit]
+        priority_order = {"urgent": 0, "high": 1, "medium": 2, "low": 3}
+        return sorted(self.recommendations, key=lambda r: priority_order.get(r.priority, 4))[:limit]
 
 
 # ==========================================
-# Engine Output Model
+# Engine Input & Output Models
 # ==========================================
+
+class BurnoutInput(BaseModel):
+    """Input chuẩn cho BurnoutEngine."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    assessment_id: str = ""
+    user_id: str = ""
+    survey: Optional[Any] = None
+    emotion: Optional[Any] = None
+    chat: Optional[Any] = None
+    trend: Optional[Any] = None
+    data_completeness: float = 0.0
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    session_id: Optional[str] = None
+    periodic_survey: Optional[Any] = None
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.session_id and not self.assessment_id:
+            self.assessment_id = self.session_id
+        elif self.assessment_id and not self.session_id:
+            self.session_id = self.assessment_id
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "assessment_id": self.assessment_id,
+            "user_id": self.user_id,
+            "survey": self.survey.model_dump() if hasattr(self.survey, "model_dump") else self.survey,
+            "data_completeness": self.data_completeness,
+            "created_at": self.created_at.isoformat(),
+        }
+
 
 class BurnoutEngineOutput(BaseModel):
     """Output từ BurnoutEngine."""
 
-    model_config = ConfigDict(
-        from_attributes=True,
-        json_schema_extra={
-            "example": {
-                "burnout": {
-                    "assessment_id": "asm_abc123",
-                    "user_id": "user_123",
-                    "burnout_score": 72.5,
-                    "risk_level": "high",
-                    "confidence": 0.85,
-                    "data_completeness": 0.92,
-                    "trend": "increasing",
-                    "factors": [],
-                    "recommendations": []
-                },
-                "insight": {}
-            }
-        }
-    )
+    model_config = ConfigDict(from_attributes=True)
 
     burnout: BurnoutResult = Field(..., description="Kết quả burnout")
     insight: BurnoutInsight = Field(..., description="Insight chi tiết")
 
 
-# ==========================================
-# Legacy Support (Deprecated)
-# ==========================================
-
-# Old field names for backward compatibility
-BurnoutEngineInput = None  # Deprecated, use BurnoutInput from burnout_input_builder.py
+# Alias for backward compatibility
+BurnoutEngineInput = BurnoutInput

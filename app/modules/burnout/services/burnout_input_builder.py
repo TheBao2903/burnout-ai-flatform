@@ -414,9 +414,12 @@ class BurnoutInput:
     data_completeness: float = 0.0
     created_at: datetime = field(default_factory=datetime.utcnow)
 
+    session_id: Optional[str] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "assessment_id": self.assessment_id,
+            "session_id": self.session_id or self.assessment_id,
             "user_id": self.user_id,
             "survey": self.survey.to_dict() if self.survey else None,
             "emotion": self.emotion if isinstance(self.emotion, dict) else None,
@@ -507,6 +510,7 @@ class BurnoutInputBuilder:
 
         return BurnoutInput(
             assessment_id=self.assessment_id,
+            session_id=self.assessment_id,
             user_id=self.user_id,
             survey=survey_data,
             emotion=emotion_agg,

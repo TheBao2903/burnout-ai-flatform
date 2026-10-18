@@ -23,7 +23,7 @@ Logic:
 
 import hashlib
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from google.cloud import firestore
@@ -113,14 +113,16 @@ class AssessmentCacheRepository:
 
             # Check TTL
             cached_at = data.get("cached_at")
-            if cached_at:
-                if isinstance(cached_at, datetime):
-                    expiry = cached_at + timedelta(days=self.ttl_days)
-                    if datetime.utcnow() > expiry:
-                        # Expired - delete and return None
-                        self.collection.document(cache_key).delete()
-                        logger.debug("Cache expired for key %s", cache_key)
-                        return None
+            if cached_at and isinstance(cached_at, datetime):
+                if cached_at.tzinfo is None:
+                    cached_at = cached_at.replace(tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                expiry = cached_at + timedelta(days=self.ttl_days)
+                if now > expiry:
+                    # Expired - delete and return None
+                    self.collection.document(cache_key).delete()
+                    logger.debug("Cache expired for key %s", cache_key)
+                    return None
 
             # Cache hit
             logger.debug("Cache HIT for key %s", cache_key)

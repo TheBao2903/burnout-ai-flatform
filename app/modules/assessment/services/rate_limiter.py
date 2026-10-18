@@ -192,9 +192,7 @@ class RateLimiter:
                     "count": firestore.Increment(1),
                     "date": now.strftime("%Y-%m-%d"),
                     "created_at": firestore.SERVER_TIMESTAMP,
-                    "expires_at": firestore.Timestamp(
-                        datetime.utcnow() + timedelta(hours=25)
-                    ),
+                    "expires_at": datetime.utcnow() + timedelta(hours=25),
                 },
                 merge=True,
             )
@@ -208,9 +206,7 @@ class RateLimiter:
                     "count": firestore.Increment(1),
                     "hour": now.strftime("%Y-%m-%dT%H:00"),
                     "created_at": firestore.SERVER_TIMESTAMP,
-                    "expires_at": firestore.Timestamp(
-                        datetime.utcnow() + timedelta(hours=2)
-                    ),
+                    "expires_at": datetime.utcnow() + timedelta(hours=2),
                 },
                 merge=True,
             )

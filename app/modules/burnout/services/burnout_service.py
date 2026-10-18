@@ -12,7 +12,11 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
-from app.modules.burnout.models.burnout import BurnoutEngineOutput
+from app.modules.burnout.models.burnout import (
+    BurnoutEngineOutput,
+    BurnoutEngineInput,
+    BurnoutInput,
+)
 from app.modules.burnout.services.burnout_engine import BurnoutEngine
 from app.modules.burnout.repositories.burnout_repository import BurnoutRepository
 from app.modules.recommendation.models.recommendation import Recommendation

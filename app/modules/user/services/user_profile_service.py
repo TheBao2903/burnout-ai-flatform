@@ -67,6 +67,21 @@ class UserProfileService:
                 raise UserProfileServiceError("So dien thoai phai co 10 so")
             update_data["phone"] = phone_clean
 
+        if req.standard_working_hours_per_day is not None:
+            update_data["standard_working_hours_per_day"] = req.standard_working_hours_per_day
+
+        if req.work_days_per_week is not None:
+            update_data["work_days_per_week"] = req.work_days_per_week
+
+        if req.average_overtime_hours_per_week is not None:
+            update_data["average_overtime_hours_per_week"] = req.average_overtime_hours_per_week
+
+        if req.job_title is not None:
+            update_data["job_title"] = req.job_title
+
+        if req.industry_code is not None:
+            update_data["industry_code"] = req.industry_code
+
         if update_data:
             self.profile_repo.update_profile(uid, update_data)
 

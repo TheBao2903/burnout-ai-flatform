@@ -170,23 +170,56 @@ async def get_user(
     svc: AuthService = Depends(get_auth_service),
     admin: dict = Depends(require_admin),
 ):
-    """Chi tiết một user."""
-    user = svc.user_repo.get_by_id(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    """Chi tiết đầy đủ một user (cho Admin)."""
+    from app.core.firebase import get_firebase
+    db = get_firebase().db
+    doc = db.collection("users").document(user_id).get()
+    
+    if not doc.exists:
+        # Fallback to user_repo lookup
+        user = svc.user_repo.get_by_id(user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        data = {
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "full_name": user.full_name,
+            "phone": user.phone,
+            "role": user.role,
+            "is_active": user.is_active,
+            "email_verified": user.email_verified,
+            "created_at": user.created_at,
+            "updated_at": user.updated_at,
+            "last_login_at": user.last_login_at,
+        }
+    else:
+        data = doc.to_dict() or {}
+        data["id"] = doc.id
+
+    avatar_val = data.get("avatar") or data.get("avatar_url") or ""
 
     return {
-        "id": user.id,
-        "username": user.username,
-        "email": user.email,
-        "full_name": user.full_name,
-        "phone": user.phone,
-        "role": user.role,
-        "is_active": user.is_active,
-        "email_verified": user.email_verified,
-        "created_at": _format_datetime(user.created_at),
-        "updated_at": _format_datetime(user.updated_at),
-        "last_login_at": _format_datetime(user.last_login_at),
+        "id": data.get("id", user_id),
+        "uid": data.get("id", user_id),
+        "username": data.get("username", ""),
+        "email": data.get("email", ""),
+        "full_name": data.get("full_name") or data.get("username", ""),
+        "phone": data.get("phone", ""),
+        "avatar": avatar_val,
+        "avatar_url": avatar_val,
+        "role": data.get("role", "user"),
+        "is_active": data.get("is_active", True),
+        "email_verified": data.get("email_verified", False),
+        "gender": data.get("gender"),
+        "birthday": data.get("birthday"),
+        "job_title": data.get("job_title"),
+        "standard_working_hours_per_day": data.get("standard_working_hours_per_day", 8.0),
+        "work_days_per_week": data.get("work_days_per_week", 5),
+        "average_overtime_hours_per_week": data.get("average_overtime_hours_per_week", 0.0),
+        "created_at": _format_datetime(data.get("created_at")),
+        "updated_at": _format_datetime(data.get("updated_at")),
+        "last_login_at": _format_datetime(data.get("last_login_at")),
     }
 
 
@@ -198,6 +231,12 @@ class UpdateUserRequest(BaseModel):
     phone: Optional[str] = None
     role: Optional[str] = None
     is_active: Optional[bool] = None
+    gender: Optional[str] = None
+    birthday: Optional[str] = None
+    job_title: Optional[str] = None
+    standard_working_hours_per_day: Optional[float] = None
+    work_days_per_week: Optional[int] = None
+    average_overtime_hours_per_week: Optional[float] = None
 
 
 @router.put("/users/{user_id}")
@@ -221,36 +260,71 @@ async def update_user(
         raise HTTPException(status_code=400, detail="Cannot deactivate yourself")
 
     try:
-        updated = svc.user_repo.update_user(
-            user_id=user_id,
-            full_name=req.full_name,
-            email=req.email,
-            phone=req.phone,
-            is_active=req.is_active,
-        )
-        if not updated:
-            raise HTTPException(status_code=404, detail="User not found")
+        from app.core.firebase import get_firebase
+        from datetime import datetime
+        db = get_firebase().db
+        
+        # Build update dict
+        update_dict = {"updated_at": datetime.utcnow()}
+        if req.full_name is not None:
+            update_dict["full_name"] = req.full_name
+        if req.email is not None:
+            update_dict["email"] = req.email.strip().lower()
+        if req.phone is not None:
+            update_dict["phone"] = req.phone
+        if req.is_active is not None:
+            update_dict["is_active"] = req.is_active
+            try:
+                from firebase_admin import auth as fb_auth
+                fb_auth.update_user(user_id, disabled=not req.is_active)
+                logger.info("Firebase Auth user %s disabled=%s", user_id, not req.is_active)
+            except Exception as e:
+                logger.warning("Could not sync disabled status with Firebase Auth for %s: %s", user_id, e)
 
-        # Update role separately if needed
-        if req.role:
-            from app.core.firebase import get_firebase
-            db = get_firebase().db
-            db.collection("users").document(user_id).update({"role": req.role})
-            updated = svc.user_repo.get_by_id(user_id)
+        if req.role is not None:
+            update_dict["role"] = req.role
+        if req.gender is not None:
+            update_dict["gender"] = req.gender
+        if req.birthday is not None:
+            update_dict["birthday"] = req.birthday
+        if req.job_title is not None:
+            update_dict["job_title"] = req.job_title
+        if req.standard_working_hours_per_day is not None:
+            update_dict["standard_working_hours_per_day"] = float(req.standard_working_hours_per_day)
+        if req.work_days_per_week is not None:
+            update_dict["work_days_per_week"] = int(req.work_days_per_week)
+        if req.average_overtime_hours_per_week is not None:
+            update_dict["average_overtime_hours_per_week"] = float(req.average_overtime_hours_per_week)
 
-        logger.info("Admin %s updated user %s", admin["username"], user_id)
+        db.collection("users").document(user_id).set(update_dict, merge=True)
+        logger.info("Admin %s updated user %s with %s", admin.get("username", "admin"), user_id, list(update_dict.keys()))
+
+        # Return updated user
+        doc = db.collection("users").document(user_id).get()
+        data = doc.to_dict() or {}
+        avatar_val = data.get("avatar") or data.get("avatar_url") or ""
 
         return {
-            "id": updated.id,
-            "username": updated.username,
-            "email": updated.email,
-            "full_name": updated.full_name,
-            "phone": updated.phone,
-            "role": updated.role,
-            "is_active": updated.is_active,
-            "email_verified": updated.email_verified,
-            "created_at": _format_datetime(updated.created_at),
-            "updated_at": _format_datetime(updated.updated_at),
+            "id": user_id,
+            "uid": user_id,
+            "username": data.get("username", ""),
+            "email": data.get("email", ""),
+            "full_name": data.get("full_name") or data.get("username", ""),
+            "phone": data.get("phone", ""),
+            "avatar": avatar_val,
+            "avatar_url": avatar_val,
+            "role": data.get("role", "user"),
+            "is_active": data.get("is_active", True),
+            "email_verified": data.get("email_verified", False),
+            "gender": data.get("gender"),
+            "birthday": data.get("birthday"),
+            "job_title": data.get("job_title"),
+            "standard_working_hours_per_day": data.get("standard_working_hours_per_day", 8.0),
+            "work_days_per_week": data.get("work_days_per_week", 5),
+            "average_overtime_hours_per_week": data.get("average_overtime_hours_per_week", 0.0),
+            "created_at": _format_datetime(data.get("created_at")),
+            "updated_at": _format_datetime(data.get("updated_at")),
+            "last_login_at": _format_datetime(data.get("last_login_at")),
         }
     except Exception as exc:
         if isinstance(exc, HTTPException):
@@ -265,19 +339,33 @@ async def delete_user(
     svc: AuthService = Depends(get_auth_service),
     admin: dict = Depends(require_admin),
 ):
-    """Xóa user (soft delete - set is_active=False)."""
+    """Vô hiệu hóa user (soft delete - set is_active=False, bảo lưu toàn bộ dữ liệu lịch sử)."""
     # Cannot delete self
     if user_id == admin["uid"]:
-        raise HTTPException(status_code=400, detail="Cannot delete yourself")
+        raise HTTPException(status_code=400, detail="Cannot deactivate yourself")
 
-    # Get user first
-    user = svc.user_repo.get_by_id(user_id)
-    if not user:
+    from app.core.firebase import get_firebase
+    from datetime import datetime
+    db = get_firebase().db
+    doc_ref = db.collection("users").document(user_id)
+    doc = doc_ref.get()
+    if not doc.exists:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Soft delete - just deactivate
-    svc.user_repo.update_user(user_id=user_id, is_active=False)
+    # Soft delete: update is_active to False in Firestore (dữ liệu không bao giờ bị xóa vĩnh viễn)
+    doc_ref.set({
+        "is_active": False,
+        "updated_at": datetime.utcnow()
+    }, merge=True)
 
-    logger.info("Admin %s deleted/deactivated user %s", admin["username"], user_id)
+    # Disable in Firebase Auth
+    try:
+        from firebase_admin import auth as fb_auth
+        fb_auth.update_user(user_id, disabled=True)
+        logger.info("Firebase Auth user %s disabled=True", user_id)
+    except Exception as e:
+        logger.warning("Could not disable user in Firebase Auth for %s: %s", user_id, e)
 
-    return {"message": "User deactivated successfully", "user_id": user_id}
+    logger.info("Admin %s deactivated user %s", admin.get("username", "admin"), user_id)
+
+    return {"message": "User deactivated successfully", "user_id": user_id, "is_active": False}

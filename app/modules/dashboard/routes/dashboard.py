@@ -12,6 +12,7 @@ Lưu ý: Dashboard CHỈ đọc dữ liệu, KHÔNG tính toán lại.
 ==============================================================
 """
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
@@ -463,9 +464,14 @@ async def get_user_dashboard_analytics(
     now = datetime.utcnow()
     month_start = datetime(now.year, now.month, 1)
 
-    # === BURNOUT DATA ===
-    burnout_history = burnout_repo.list_by_user(user_id, limit=100)
+    # === LOAD REPOSITORIES CONCURRENTLY ===
+    burnout_history, emotions, assessments = await asyncio.gather(
+        asyncio.to_thread(burnout_repo.list_by_user, user_id, 100),
+        asyncio.to_thread(emotion_repo.list_by_user, user_id, 500),
+        asyncio.to_thread(assessment_repo.list_by_user, user_id, 100),
+    )
 
+    # === BURNOUT DATA ===
     total_burnout = len(burnout_history)
 
     # Calculate avg burnout score
@@ -479,28 +485,22 @@ async def get_user_dashboard_analytics(
         current_risk = burnout_history[0].get("risk_level", "unknown")
         current_trend = burnout_history[0].get("trend", "insufficient_data")
 
-    # Build burnout trend (daily for last 30 days)
+    # Build burnout trend (daily for last 90 days)
+    burnout_daily: Dict[str, int] = {}
+    for b in burnout_history:
+        analyzed = b.get("analyzed_at")
+        if analyzed:
+            analyzed_dt = _normalize_datetime(analyzed)
+            if analyzed_dt:
+                date_key = analyzed_dt.strftime("%Y-%m-%d")
+                burnout_daily[date_key] = burnout_daily.get(date_key, 0) + 1
+
     burnout_trend = []
     for i in range(89, -1, -1):
         day = (now - timedelta(days=i)).strftime("%Y-%m-%d")
-        count = 0
-        for b in burnout_history:
-            analyzed = b.get("analyzed_at")
-            if analyzed:
-                if hasattr(analyzed, 'to_datetime'):
-                    analyzed = analyzed.to_datetime()
-                if isinstance(analyzed, str):
-                    try:
-                        analyzed = datetime.fromisoformat(analyzed.replace("Z", "+00:00"))
-                    except:
-                        continue
-                if isinstance(analyzed, datetime) and analyzed.strftime("%Y-%m-%d") == day:
-                    count += 1
-        burnout_trend.append({"date": day, "count": count})
+        burnout_trend.append({"date": day, "count": burnout_daily.get(day, 0)})
 
     # === EMOTION DATA ===
-    emotions = emotion_repo.list_by_user(user_id, limit=500)
-
     total_emotions = len(emotions)
 
     # Calculate avg confidence
@@ -524,8 +524,6 @@ async def get_user_dashboard_analytics(
             emotions_this_month += 1
 
     # === ASSESSMENT DATA ===
-    assessments = assessment_repo.list_by_user(user_id, limit=100)
-
     total_assessments = len(assessments)
     completed = sum(1 for a in assessments if a.get("status") == "completed")
     completion_rate = round((completed / total_assessments * 100), 1) if total_assessments > 0 else 0.0
@@ -754,6 +752,12 @@ class BurnoutAnalyticsResponse(BaseModel):
     available_factors: list = Field(default_factory=list, description="Available factors")
     missing_factors: list = Field(default_factory=list, description="Missing factors")
 
+    # STA Scientific Dimensions
+    sta_core: Optional[dict] = Field(default=None, description="OLBI Burnout Core: Exhaustion & Disengagement")
+    sta_context: Optional[dict] = Field(default=None, description="Context: Demands, Recovery, Overload, Work Changes")
+    sta_trend: list = Field(default_factory=list, description="Daily trend of STA dimensions")
+    synthesized_insight: Optional[dict] = Field(default=None, description="Synthesized contextual narrative")
+
 
 def _generate_warnings(
     latest: Optional[dict],
@@ -882,9 +886,260 @@ def _generate_warnings(
     return warnings
 
 
+async def _compute_sta_analytics(range_surveys: list, days: int, user_id: Optional[str] = None, profile: Optional[dict] = None) -> dict:
+    """Tổng hợp phân tích theo chuẩn khoa học STA (Core - Context - Trend - Synthesized Insight)."""
+    if not range_surveys:
+        return {
+            "sta_core": None,
+            "sta_context": None,
+            "sta_trend": [],
+            "synthesized_insight": None,
+        }
+
+    ex_list = []
+    dis_list = []
+    jd_list = []
+    sleep_list = []
+    rec_list = []
+    ov_list = []
+    reason_counter: Dict[str, int] = {}
+    other_reasons = []
+    ot_hours_total = 0.0
+    ot_days_count = 0
+    sta_trend_items = []
+
+    for s in range_surveys:
+        raw = s.get("survey") or {}
+        c_at = _normalize_datetime(s.get("completed_at") or s.get("created_at"))
+        date_str = c_at.strftime("%Y-%m-%d") if c_at else "N/A"
+        iso_str = c_at.isoformat() if c_at else None
+
+        # 1. Exhaustion (E1-E3, Likert 1-5)
+        ex_dict = raw.get("exhaustion") or {}
+        if ex_dict and any(k in ex_dict for k in ("e1", "e2", "e3")):
+            e_vals = [float(v) for v in ex_dict.values() if v is not None]
+            ex = round(sum(e_vals) / len(e_vals), 2) if e_vals else 2.5
+        else:
+            st = float(raw.get("stress_level") or 5)
+            ex = round(max(1.0, min(5.0, st / 2.0)), 2)
+        ex_list.append(ex)
+
+        # 2. Disengagement (D1-D3, Likert 1-5)
+        dis_dict = raw.get("disengagement") or {}
+        if dis_dict and any(k in dis_dict for k in ("d1", "d2", "d3")):
+            d_vals = [float(v) for v in dis_dict.values() if v is not None]
+            dis = round(sum(d_vals) / len(d_vals), 2) if d_vals else 2.0
+        else:
+            mot = float(raw.get("motivation_level") or 5)
+            dis = round(max(1.0, min(5.0, (11.0 - mot) / 2.0)), 2)
+        dis_list.append(dis)
+
+        # 3. Job Demands (JD1-JD3, Likert 1-5)
+        jd_dict = raw.get("job_demands") or {}
+        if jd_dict and any(k in jd_dict for k in ("jd1", "jd2", "jd3")):
+            jd_vals = [float(v) for v in jd_dict.values() if v is not None]
+            jd = round(sum(jd_vals) / len(jd_vals), 2) if jd_vals else 2.5
+        else:
+            jd = 3.0
+        jd_list.append(jd)
+
+        # 4. Sleep & Recovery
+        sleep_h = float(raw.get("sleep_hours") or (raw.get("recovery") or {}).get("sleep_hours") or 7.0)
+        rec_s = int(raw.get("recovery_score") or (raw.get("recovery") or {}).get("recovery_score") or 3)
+        sleep_list.append(sleep_h)
+        rec_list.append(rec_s)
+
+        # 5. Overload & Reasons
+        ov = int(raw.get("quick_overload") or (raw.get("quick_overload_data") or {}).get("rating") or 2)
+        ov_list.append(ov)
+        reasons = raw.get("overload_reasons") or (raw.get("quick_overload_data") or {}).get("reasons") or []
+        for r in reasons:
+            clean_r = r.split("(")[0].strip() if "(" in r else r.strip()
+            if clean_r:
+                reason_counter[clean_r] = reason_counter.get(clean_r, 0) + 1
+
+        other_text = raw.get("other_overload_reason") or (raw.get("quick_overload_data") or {}).get("other_reason")
+        if other_text and isinstance(other_text, str) and other_text.strip() and other_text.strip() not in other_reasons:
+            other_reasons.append(other_text.strip())
+
+        # 6. Overtime
+        had_ot = bool(raw.get("has_overtime_today") or (raw.get("work_changes") or {}).get("had_overtime"))
+        ot_h = float(raw.get("overtime_hours_today") or (raw.get("work_changes") or {}).get("overtime_hours") or 0.0)
+        if had_ot or ot_h > 0:
+            ot_hours_total += ot_h
+            ot_days_count += 1
+
+        sta_trend_items.append({
+            "date": date_str,
+            "analyzed_at": iso_str,
+            "exhaustion": ex,
+            "disengagement": dis,
+            "job_demands": jd,
+            "recovery_score": rec_s,
+            "sleep_hours": sleep_h,
+            "quick_overload": ov,
+        })
+
+    # Aggregates
+    n = len(range_surveys)
+    avg_ex = round(sum(ex_list) / n, 2)
+    avg_dis = round(sum(dis_list) / n, 2)
+    avg_jd = round(sum(jd_list) / n, 2)
+    avg_sleep = round(sum(sleep_list) / n, 1)
+    avg_rec = round(sum(rec_list) / n, 1)
+    overload_count = sum(1 for o in ov_list if o >= 4)
+
+    def calc_trend(series):
+        if len(series) < 2:
+            return "stable"
+        mid = len(series) // 2
+        first_half = sum(series[:mid]) / max(1, mid)
+        second_half = sum(series[mid:]) / max(1, len(series) - mid)
+        diff = second_half - first_half
+        if diff >= 0.25:
+            return "increasing"
+        elif diff <= -0.25:
+            return "decreasing"
+        return "stable"
+
+    ex_trend = calc_trend(ex_list)
+    dis_trend = calc_trend(dis_list)
+
+    def get_score_level(score):
+        if score >= 3.8:
+            return "critical"
+        elif score >= 3.2:
+            return "high"
+        elif score >= 2.5:
+            return "medium"
+        return "low"
+
+    total_reasons_selected = sum(reason_counter.values())
+    top_reasons = []
+    for r, count in sorted(reason_counter.items(), key=lambda x: x[1], reverse=True):
+        pct = round((count / max(1, total_reasons_selected)) * 100, 1)
+        top_reasons.append({
+            "reason": r,
+            "count": count,
+            "percentage": pct,
+        })
+
+    sta_core = {
+        "exhaustion": {
+            "score": avg_ex,
+            "level": get_score_level(avg_ex),
+            "trend": ex_trend,
+            "label": "Cạn kiệt năng lượng (Exhaustion)",
+        },
+        "disengagement": {
+            "score": avg_dis,
+            "level": get_score_level(avg_dis),
+            "trend": dis_trend,
+            "label": "Mất gắn kết (Disengagement)",
+        },
+    }
+
+    rec_status = "poor" if avg_rec < 2.5 or avg_sleep < 6.0 else ("good" if avg_rec >= 3.5 and avg_sleep >= 7.0 else "moderate")
+
+    sta_context = {
+        "job_demands": {
+            "score": avg_jd,
+            "level": get_score_level(avg_jd),
+            "label": "Yêu cầu & Áp lực công việc",
+        },
+        "recovery": {
+            "avg_sleep_hours": avg_sleep,
+            "avg_recovery_score": avg_rec,
+            "status": rec_status,
+        },
+        "overload_stats": {
+            "overload_count": overload_count,
+            "total_checkins": n,
+            "top_reasons": top_reasons[:5],
+            "other_reasons": other_reasons[:5],
+        },
+        "work_changes": {
+            "total_overtime_hours": round(ot_hours_total, 1),
+            "overtime_days": ot_days_count,
+        },
+    }
+
+    # 7. Resolve Industry Context & Cross-Metric Burnout Archetype
+    job_title = None
+    industry_code = None
+    if profile:
+        job_title = profile.get("job_title")
+        industry_code = profile.get("industry_code")
+    elif user_id:
+        try:
+            from app.modules.user.services.user_profile_service import get_profile_service
+            p = get_profile_service().get_profile(user_id) or {}
+            job_title = p.get("job_title")
+            industry_code = p.get("industry_code")
+        except Exception:
+            pass
+
+    from app.modules.burnout.helpers.industry_archetypes import resolve_industry_context
+    from app.modules.burnout.helpers.matrix_resolver import resolve_burnout_archetype
+
+    ind_ctx = resolve_industry_context(industry_code=industry_code, job_title=job_title)
+    daily_stats = {
+        "job_demands": avg_jd,
+        "sleep_hours": avg_sleep,
+        "recovery_score": avg_rec,
+        "ot_hours_total": ot_hours_total,
+        "overload_count": overload_count,
+    }
+    archetype = resolve_burnout_archetype(avg_ex, avg_dis, daily_stats)
+
+    # 8. Generate Synthesized Insight narrative using Gemini AI Interpreter (Tầng 3)
+    evidence = {
+        "days": days,
+        "total_checkins": n,
+        "exhaustion_level": get_score_level(avg_ex),
+        "exhaustion_trend": ex_trend,
+        "disengagement_level": get_score_level(avg_dis),
+        "disengagement_trend": dis_trend,
+        "recovery_status": rec_status,
+        "overload_count": overload_count,
+        "top_reasons": [r["reason"] for r in top_reasons[:5]],
+        "other_reasons": other_reasons[:5],
+        "ot_hours_total": round(ot_hours_total, 1),
+        "ot_days_count": ot_days_count,
+        # Industry & Archetype context
+        "job_title": job_title or ind_ctx.typical_roles[0],
+        "industry_name": ind_ctx.name,
+        "industry_icon": ind_ctx.icon,
+        "vocabulary_hints": ind_ctx.vocabulary_hints,
+        "stressors_context": ind_ctx.stressors_context,
+        "archetype_name": f"{archetype.icon} {archetype.name}",
+        "empathy_direction": archetype.empathy_direction,
+        "ai_prompt_instruction": archetype.ai_prompt_instruction,
+    }
+
+    try:
+        from app.modules.dashboard.services.dashboard_ai_interpreter import get_dashboard_ai_interpreter
+        interpreter = get_dashboard_ai_interpreter()
+        synthesized_insight = await asyncio.to_thread(interpreter.generate_synthesized_insight, evidence)
+    except Exception as e:
+        logger.warning("Failed to invoke Dashboard AI Interpreter: %s", e)
+        synthesized_insight = {
+            "summary": f"Trong {days} ngày vừa qua, nhịp làm việc và năng lượng của bạn duy trì ở mức cân bằng tốt.",
+            "key_observations": ["Các chỉ số bối cảnh công việc và năng lượng duy trì ở mức ổn định."],
+        }
+
+    return {
+        "sta_core": sta_core,
+        "sta_context": sta_context,
+        "sta_trend": sta_trend_items,
+        "synthesized_insight": synthesized_insight,
+    }
+
+
 @router.get("/burnout-analytics", response_model=BurnoutAnalyticsResponse)
 async def get_burnout_analytics(
-    days: int = Query(default=30, ge=7, le=90, description="Số ngày để phân tích"),
+    days: int = Query(default=30, ge=1, le=365, description="Số ngày để phân tích"),
+    user_id: Optional[str] = Query(default=None, description="User ID (dành cho admin xem chi tiết user)"),
     user: dict = Depends(get_current_user),
 ):
     """Lấy burnout analytics tổng hợp cho user.
@@ -900,7 +1155,10 @@ async def get_burnout_analytics(
     - Warnings dựa trên data
     - AI summary và recommendations
     """
-    user_id = user["uid"]
+    target_user_id = user["uid"]
+    if user_id and user.get("role") == "admin":
+        target_user_id = user_id
+    user_id = target_user_id
     now = datetime.utcnow()
     start_date = now - timedelta(days=days)
 
@@ -909,8 +1167,15 @@ async def get_burnout_analytics(
     survey_repo = get_survey_repo()
     chat_repo = get_chat_repo()
 
-    # Load burnout history
-    all_burnout_history = burnout_repo.list_by_user(user_id, limit=100)
+    from app.modules.user.services.user_profile_service import get_profile_service
+    profile_service = get_profile_service()
+
+    # Load burnout history, survey history, and profile concurrently in parallel threads
+    all_burnout_history, all_user_surveys, user_profile = await asyncio.gather(
+        asyncio.to_thread(burnout_repo.list_by_user, user_id, 100),
+        asyncio.to_thread(survey_repo.list_by_user, user_id, 100),
+        asyncio.to_thread(profile_service.get_profile, user_id),
+    )
 
     # Filter by date range for trend
     filtered_history = []
@@ -928,16 +1193,49 @@ async def get_burnout_analytics(
     latest = filtered_history[-1] if filtered_history else None
     previous = filtered_history[-2] if len(filtered_history) >= 2 else None
 
+    # Helper to safely convert recommendation to dict without exposing string methods
+    def _recommendation_to_dict(r):
+        if isinstance(r, str):
+            return {
+                "title": r,
+                "description": r,
+                "priority": "medium",
+                "type": "behavior",
+                "target_factor": None,
+            }
+        if isinstance(r, dict):
+            t = r.get("title", "")
+            d = r.get("description", "")
+            return {
+                "title": str(t) if not callable(t) else "",
+                "description": str(d) if not callable(d) else "",
+                "priority": r.get("priority") or "medium",
+                "type": r.get("type") or "behavior",
+                "target_factor": r.get("target_factor"),
+            }
+        # Pydantic Recommendation object
+        t = getattr(r, "title", "")
+        d = getattr(r, "description", "")
+        return {
+            "title": str(t) if not callable(t) else str(r),
+            "description": str(d) if not callable(d) else "",
+            "priority": getattr(r, "priority", None) or "medium",
+            "type": getattr(r, "type", None) or "behavior",
+            "target_factor": getattr(r, "target_factor", None),
+        }
+
     # If no burnout results, calculate from survey/emotion/chat history
     if not latest:
         try:
             from app.modules.burnout.services.burnout_input_builder import BurnoutInputBuilder
             from app.modules.burnout.services.burnout_engine import get_burnout_engine
 
-            # Load all available data
-            surveys = survey_repo.list_by_user(user_id, limit=20)
-            emotions = emotion_repo.list_by_user(user_id, limit=100)
-            chats = chat_repo.list_by_user(user_id, limit=50)
+            # Load emotions & chats concurrently (surveys already loaded in parallel above)
+            surveys = all_user_surveys[:20]
+            emotions, chats = await asyncio.gather(
+                asyncio.to_thread(emotion_repo.list_by_user, user_id, 100),
+                asyncio.to_thread(chat_repo.list_by_user, user_id, 50),
+            )
 
             if surveys:
                 # Use latest survey for current analysis
@@ -965,7 +1263,6 @@ async def get_burnout_analytics(
                 engine_output = engine.analyze(burnout_input)
                 burnout_result = engine_output.burnout
 
-                # Build response from calculated result
                 latest = {
                     "burnout_score": burnout_result.burnout_score,
                     "risk_level": burnout_result.risk_level,
@@ -983,13 +1280,7 @@ async def get_burnout_analytics(
                         for f in burnout_result.factors
                     ],
                     "recommendations": [
-                        {
-                            "title": r.title,
-                            "description": r.description,
-                            "priority": r.priority,
-                            "type": r.type,
-                            "target_factor": r.target_factor,
-                        }
+                        _recommendation_to_dict(r)
                         for r in burnout_result.recommendations
                     ],
                     "insight": burnout_result.insight,
@@ -1091,16 +1382,20 @@ async def get_burnout_analytics(
             "ai_summary": insight.get("summary") if insight else None,
             "key_observations": insight.get("key_observations", []) if insight else [],
             "recommendations": [
-                {
-                    "title": r.get("title", "") if isinstance(r, dict) else getattr(r, "title", ""),
-                    "description": r.get("description", "") if isinstance(r, dict) else getattr(r, "description", ""),
-                    "priority": r.get("priority", "medium") if isinstance(r, dict) else getattr(r, "priority", "medium"),
-                    "type": r.get("type", "behavior") if isinstance(r, dict) else getattr(r, "type", "behavior"),
-                    "target_factor": r.get("target_factor") if isinstance(r, dict) else getattr(r, "target_factor", None),
-                }
+                _recommendation_to_dict(r)
                 for r in recommendations[:5]  # Top 5 recommendations
             ],
         }
+
+    # === COMPUTE STA SCIENTIFIC ANALYTICS ===
+    range_surveys = []
+    for s in all_user_surveys:
+        c_at = _normalize_datetime(s.get("completed_at") or s.get("created_at"))
+        if c_at and c_at >= start_date:
+            range_surveys.append(s)
+    range_surveys.sort(key=lambda x: _normalize_datetime(x.get("completed_at") or x.get("created_at")) or datetime.min)
+
+    sta_data = await _compute_sta_analytics(range_surveys, days, user_id=user_id, profile=user_profile)
 
     # Statistics
     stats = {
@@ -1123,4 +1418,8 @@ async def get_burnout_analytics(
         data_completeness=data_completeness,
         available_factors=available_factors,
         missing_factors=missing_factors,
+        sta_core=sta_data["sta_core"],
+        sta_context=sta_data["sta_context"],
+        sta_trend=sta_data["sta_trend"],
+        synthesized_insight=sta_data["synthesized_insight"],
     )

@@ -27,7 +27,7 @@ class User(BaseModel):
     id: str
     username: str
     email: Optional[str] = None
-    password_hash: str
+    password_hash: Optional[str] = ""
     full_name: Optional[str] = None
     phone: Optional[str] = None
     avatar_url: Optional[str] = None

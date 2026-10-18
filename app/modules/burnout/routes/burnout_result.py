@@ -66,13 +66,24 @@ class BurnoutResultResponse(BaseModel):
     status: str
     user_id: str
 
-    burnout_score: float
-    risk_level: str
-    trend: str
-    data_completeness: float
+    # STA Scientific Architecture (Item 17)
+    burnout_core: Optional[dict] = None
+    context: Optional[dict] = None
+    supporting_signals: Optional[dict] = None
+    data_quality: Optional[str] = "valid"
+    data_sufficiency: Optional[str] = "sufficient"
+    interpretation: Optional[str] = None
+    confidence: Optional[float] = None
+    disclaimer: Optional[str] = None
 
-    factors: list
-    recommendations: list
+    # Legacy fields
+    burnout_score: float = 0.0
+    risk_level: str = "low"
+    trend: str = "stable"
+    data_completeness: float = 1.0
+
+    factors: list = []
+    recommendations: list = []
 
     created_at: str
     completed_at: Optional[str] = None
@@ -201,6 +212,14 @@ async def get_burnout_result(
         assessment_id=assessment_id,
         status=assessment_status,
         user_id=user_id,
+        burnout_core=burnout_result.get("burnout_core"),
+        context=burnout_result.get("context"),
+        supporting_signals=burnout_result.get("supporting_signals"),
+        data_quality=burnout_result.get("data_quality", "valid"),
+        data_sufficiency=burnout_result.get("data_sufficiency", "sufficient"),
+        interpretation=burnout_result.get("interpretation"),
+        confidence=burnout_result.get("confidence"),
+        disclaimer=burnout_result.get("disclaimer"),
         burnout_score=burnout_score,
         risk_level=risk_level,
         trend=trend,

@@ -34,44 +34,50 @@ logger = logging.getLogger("burnout.auth.routes")
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 
-_security = HTTPBearer(auto_error=False)
+from app.core.deps import get_current_user, require_admin
+from app.modules.auth.repositories.user_repository import UserRepository, get_user_repository
 
 
 # ==========================================
-# Dependencies
+# Sync Firebase User Profile
 # ==========================================
 
-async def get_current_user(
-    credentials: Optional[HTTPAuthorizationCredentials] = Security(_security),
-) -> dict:
-    """Verify JWT, tra dict user info dang chuan hoa."""
-    if credentials is None or not credentials.credentials:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
+class SyncProfileRequest(BaseModel):
+    full_name: Optional[str] = None
+    phone: Optional[str] = None
+    avatar_url: Optional[str] = None
 
-    svc = get_auth_service()
-    try:
-        user = svc.get_current_user(credentials.credentials)
-    except AuthError as exc:
-        raise HTTPException(status_code=401, detail=str(exc))
 
+@router.post("/sync")
+async def sync_firebase_user_route(
+    payload: Optional[SyncProfileRequest] = None,
+    user: dict = Depends(get_current_user),
+    user_repo: UserRepository = Depends(get_user_repository),
+):
+    """Đồng bộ thông tin người dùng từ Firebase Auth vào Firestore."""
+    uid = user["uid"]
+    db_user = user_repo.get_by_id(uid)
+    if not db_user:
+        db_user = user_repo.sync_firebase_user(
+            uid=uid,
+            email=user.get("email"),
+            full_name=payload.full_name if payload else user.get("name"),
+            picture=payload.avatar_url if payload else user.get("picture"),
+            email_verified=user.get("email_verified", False),
+        )
     return {
-        "uid": user.id,
-        "username": user.username,
-        "role": user.role,
-        "email": user.email,
-        "name": user.full_name or user.username,
-        "picture": user.avatar_url,
-        "email_verified": user.email_verified,
+        "id": db_user.id,
+        "uid": db_user.id,
+        "username": db_user.username,
+        "email": db_user.email,
+        "full_name": db_user.full_name,
+        "phone": db_user.phone,
+        "avatar_url": db_user.avatar_url,
+        "role": db_user.role,
+        "is_active": db_user.is_active,
+        "email_verified": db_user.email_verified,
     }
 
-
-async def require_admin(
-    user: dict = Depends(get_current_user),
-) -> dict:
-    """Chi cho phep admin."""
-    if user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin role required")
-    return user
 
 
 # ==========================================
@@ -173,6 +179,7 @@ class MeResponse(BaseModel):
     """Response cho GET /api/auth/me."""
 
     id: str
+    uid: Optional[str] = None
     username: str
     email: Optional[str] = None
     full_name: Optional[str] = None
@@ -197,8 +204,16 @@ async def me(
     except AuthError:
         raise HTTPException(status_code=401, detail="User not found")
 
+    def _fmt(dt):
+        if not dt:
+            return ""
+        if hasattr(dt, "isoformat"):
+            return dt.isoformat() + "Z"
+        return str(dt)
+
     return MeResponse(
         id=db_user.id,
+        uid=db_user.id,
         username=db_user.username,
         email=db_user.email,
         full_name=db_user.full_name,
@@ -207,9 +222,9 @@ async def me(
         role=db_user.role,
         is_active=db_user.is_active,
         email_verified=db_user.email_verified,
-        created_at=db_user.created_at.isoformat() + "Z" if db_user.created_at else "",
-        updated_at=db_user.updated_at.isoformat() + "Z" if db_user.updated_at else "",
-        last_login_at=db_user.last_login_at.isoformat() + "Z" if db_user.last_login_at else None,
+        created_at=_fmt(db_user.created_at),
+        updated_at=_fmt(db_user.updated_at),
+        last_login_at=_fmt(db_user.last_login_at) if db_user.last_login_at else None,
     )
 
 

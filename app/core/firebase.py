@@ -83,24 +83,26 @@ class FirebaseConfig:
     @property
     def db(self) -> firestore.Client:
         """
-        Lấy Firestore client.
-
-        Raises:
-            RuntimeError: Nếu chưa gọi initialize()
+        Lấy Firestore client. Tự động lazy initialize nếu chưa khởi tạo.
         """
         if self._db is None:
-            raise RuntimeError(
-                "Firebase chưa được khởi tạo. Gọi FirebaseConfig().initialize() trước."
-            )
+            try:
+                root_path = Path(__file__).resolve().parent.parent.parent
+                cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or str(root_path / "config" / "serviceAccountKey.json")
+                if not Path(cred_path).is_absolute():
+                    cred_path = str(root_path / cred_path)
+                self.initialize(credential_path=cred_path if Path(cred_path).exists() else None)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Firebase chưa được khởi tạo và lazy init thất bại: {e}"
+                ) from e
         return self._db
 
     @property
     def app(self) -> firebase_admin.App:
         """Lấy Firebase app instance."""
         if self._app is None:
-            raise RuntimeError(
-                "Firebase chưa được khởi tạo. Gọi FirebaseConfig().initialize() trước."
-            )
+            _ = self.db  # Kích hoạt lazy init nếu chưa khởi tạo
         return self._app
 
     def close(self) -> None:
@@ -160,6 +162,7 @@ class FirestoreCollections:
     # History collections (lưu lịch sử user)
     CHAT_HISTORY = "chat_history"      # Lịch sử chat messages
     SURVEY_HISTORY = "survey_history"  # Lịch sử survey responses
+    PERIODIC_SURVEYS = "periodic_surveys"  # Khảo sát định kỳ (Job Resources + Six Areas)
 
     # Auth-related collections
     AUTH_SESSIONS = "auth_sessions"

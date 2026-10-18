@@ -89,10 +89,23 @@ class DeepFaceAnalyzer(BaseEmotionAnalyzer):
 
     def _ensure_deps(self):
         """Lazy import deepface, cv2, numpy."""
+        import pathlib
+        import sys
+        # Dynamic path discovery: find external/deepface in project tree
+        _curr = pathlib.Path(__file__).resolve().parent
+        while _curr != _curr.parent:
+            _ext = _curr / "external"
+            if (_ext / "deepface").exists():
+                if str(_ext) not in sys.path:
+                    sys.path.insert(0, str(_ext))
+                break
+            _curr = _curr.parent
+
         if self._deepface is None:
             try:
                 from deepface import DeepFace as _DeepFace
                 self._deepface = _DeepFace
+                self._import_error = None
             except ImportError as exc:
                 self._import_error = str(exc)
                 raise EmotionAnalysisError(
@@ -131,11 +144,21 @@ class DeepFaceAnalyzer(BaseEmotionAnalyzer):
         return "low"
 
     def _decode_image(self, image_bytes: bytes) -> Any:
-        """Decode bytes thành numpy array."""
+        """Decode bytes thành numpy array và resize tối ưu nếu ảnh quá lớn."""
         np_arr = self._np.frombuffer(image_bytes, dtype=self._np.uint8)
         img_bgr = self._cv2.imdecode(np_arr, self._cv2.IMREAD_COLOR)
         if img_bgr is None:
             raise ValueError("cv2.imdecode tra None (corrupted image)")
+
+        # Optimize: Downscale large webcam images (e.g. 1080p/2K -> max 720p) for real-time CPU inference
+        if hasattr(img_bgr, "shape") and isinstance(img_bgr.shape, tuple) and len(img_bgr.shape) >= 2:
+            h, w = img_bgr.shape[:2]
+            max_dim = max(h, w)
+            if max_dim > 720:
+                scale = 720.0 / max_dim
+                img_bgr = self._cv2.resize(
+                    img_bgr, (int(w * scale), int(h * scale)), interpolation=self._cv2.INTER_AREA
+                )
         return img_bgr
 
     def _extract_face_confidence(self, result: list) -> tuple[int, float]:
@@ -160,7 +183,7 @@ class DeepFaceAnalyzer(BaseEmotionAnalyzer):
         try:
             result = self._deepface.analyze(
                 img_path=img_bgr,
-                actions=["emotion", "age", "gender"],
+                actions=["emotion"],
                 enforce_detection=False,
                 detector_backend=backend,
             )
@@ -203,8 +226,8 @@ class DeepFaceAnalyzer(BaseEmotionAnalyzer):
         used_backend = "none"
         warnings = []
 
-        # Detector priority: mediapipe > mtcnn > ssd > opencv
-        detector_backends = ["opencv", "ssd", "mtcnn", "mediapipe"]
+        # Detector priority: opencv (siêu nhanh ~0.05s) > ssd (chính xác ~0.3s) > mediapipe > mtcnn > retinaface
+        detector_backends = ["opencv", "ssd", "mediapipe", "mtcnn", "retinaface"]
 
         for backend in detector_backends:
             result, used_backend = self._analyze_with_backend(img_bgr, backend)
@@ -242,7 +265,11 @@ class DeepFaceAnalyzer(BaseEmotionAnalyzer):
                 confidence=0.0,
             )
 
-        r = result[0]  # Lấy face đầu tiên (highest confidence)
+        # Chon face co face_confidence cao nhat (hoac face dau tien neu khong co confidence)
+        r = max(
+            result,
+            key=lambda f: f.get("face_confidence", 0.0) if f.get("face_confidence") is not None else 0.0,
+        )
         emotions_dict = r.get("emotion", {}) or {}
         dominant = r.get("dominant_emotion", "Unknown") or "Unknown"
 
@@ -330,6 +357,8 @@ class EmotionService:
         assessment_service: Optional[Any] = None,
         embedding_service: Optional[Any] = None,
         qdrant_service: Optional[Any] = None,
+        assessment_record_repository: Optional[Any] = None,
+        **kwargs,
     ):
         self.analyzer = analyzer
         self.repository = repository
@@ -337,6 +366,7 @@ class EmotionService:
         self.assessment_service = assessment_service
         self.embedding_service = embedding_service
         self.qdrant_service = qdrant_service
+        self.assessment_record_repository = assessment_record_repository
 
     async def analyze(
         self,
@@ -400,18 +430,33 @@ class EmotionService:
                         "face_count": getattr(emotion, "face_count", 0),
                         "warnings": getattr(emotion, "warnings", []),
                     }
-                    await asyncio.to_thread(
-                        self.repository.update_assessment,
-                        emotion_id=record_id,
-                        risk_level=assessment.risk_level,
-                        summary=assessment.summary,
-                        recommendations=assessment.recommendations,
-                        key_signals=assessment.key_signals,
-                        disclaimer=assessment.disclaimer,
-                        ai_model=assessment.ai_model or "unknown",
-                        ai_prompt_version=assessment.ai_prompt_version or "v1.0",
-                        input_emotion_snapshot=snapshot,
-                    )
+                    if getattr(self, "assessment_record_repository", None) is not None:
+                        await asyncio.to_thread(
+                            self.assessment_record_repository.save,
+                            emotion_id=record_id,
+                            user_id=user_id,
+                            risk_level=assessment.risk_level,
+                            summary=assessment.summary,
+                            recommendations=assessment.recommendations,
+                            key_signals=assessment.key_signals,
+                            disclaimer=assessment.disclaimer,
+                            ai_model=assessment.ai_model or "unknown",
+                            ai_prompt_version=assessment.ai_prompt_version or "v1.0",
+                            input_emotion_snapshot=snapshot,
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            self.repository.update_assessment,
+                            emotion_id=record_id,
+                            risk_level=assessment.risk_level,
+                            summary=assessment.summary,
+                            recommendations=assessment.recommendations,
+                            key_signals=assessment.key_signals,
+                            disclaimer=assessment.disclaimer,
+                            ai_model=assessment.ai_model or "unknown",
+                            ai_prompt_version=assessment.ai_prompt_version or "v1.0",
+                            input_emotion_snapshot=snapshot,
+                        )
                 except Exception as exc:
                     logger.warning("Save assessment failed: %s", exc)
 

@@ -17,7 +17,7 @@ NOTE: Tất cả data là THẬT từ Firestore.
 
 import logging
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -120,14 +120,37 @@ def _format_datetime(dt) -> Optional[str]:
     return None
 
 
+def _to_utc_datetime(val) -> Optional[datetime]:
+    """Chuyển đổi an toàn bất kỳ dạng datetime nào sang datetime UTC có timezone."""
+    if val is None:
+        return None
+    if isinstance(val, str):
+        if not val.strip():
+            return None
+        try:
+            val = datetime.fromisoformat(val.strip().replace("Z", "+00:00"))
+        except Exception:
+            return None
+    elif hasattr(val, "to_datetime"):
+        try:
+            val = val.to_datetime()
+        except Exception:
+            pass
+    if isinstance(val, datetime):
+        if val.tzinfo is None:
+            return val.replace(tzinfo=timezone.utc)
+        return val.astimezone(timezone.utc)
+    return None
+
+
 def _parse_datetime(dt_str: str) -> datetime:
     """Parse datetime string."""
     if not dt_str:
-        return datetime.utcnow()
+        return datetime.now(timezone.utc)
     try:
         return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
     except:
-        return datetime.utcnow()
+        return datetime.now(timezone.utc)
 
 
 # ==========================================
@@ -282,10 +305,10 @@ async def get_dashboard_stats(
     Tất cả data là THẬT từ Firestore.
     """
     db = get_firebase().db
-    now = datetime.utcnow()
-    today_start = datetime(now.year, now.month, now.day)
+    now = datetime.now(timezone.utc)
+    today_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
     week_start = today_start - timedelta(days=now.weekday())
-    month_start = datetime(now.year, now.month, 1)
+    month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
 
     # Initialize stats
     users_stats = UserStats()
@@ -303,25 +326,8 @@ async def get_dashboard_stats(
         users_stats.admin_count = sum(1 for u in users if u.get("role") == "admin")
 
         for user in users:
-            last_login = user.get("last_login_at")
-            created = user.get("created_at")
-
-            # Parse dates
-            if isinstance(last_login, str):
-                try:
-                    last_login = datetime.fromisoformat(last_login.replace("Z", "+00:00"))
-                except:
-                    last_login = None
-            elif hasattr(last_login, 'to_datetime'):
-                last_login = last_login.to_datetime()
-
-            if isinstance(created, str):
-                try:
-                    created = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                except:
-                    created = None
-            elif hasattr(created, 'to_datetime'):
-                created = created.to_datetime()
+            last_login = _to_utc_datetime(user.get("last_login_at"))
+            created = _to_utc_datetime(user.get("created_at"))
 
             # Count active
             if last_login:
@@ -345,22 +351,33 @@ async def get_dashboard_stats(
         logger.error("Error getting user stats: %s", e)
 
     try:
-        # === ASSESSMENTS ===
-        assessments_ref = db.collection("assessments")
-        assessments = [doc.to_dict() | {"id": doc.id} for doc in assessments_ref.stream()]
+        # === ASSESSMENTS / SURVEYS ===
+        seen_assessment_ids = set()
+        all_assessments = []
 
-        assessment_stats.total = len(assessments)
+        # 1. From assessments collection
+        for doc in db.collection("assessments").stream():
+            d = doc.to_dict() | {"id": doc.id}
+            aid = d.get("id") or doc.id
+            seen_assessment_ids.add(aid)
+            all_assessments.append(d)
 
-        for a in assessments:
-            created = a.get("created_at")
-            if isinstance(created, str):
-                try:
-                    created = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                except:
-                    continue
-            elif hasattr(created, 'to_datetime'):
-                created = created.to_datetime()
-            else:
+        # 2. From survey_history collection (STA surveys)
+        for doc in db.collection("survey_history").stream():
+            d = doc.to_dict() | {"id": doc.id}
+            aid = d.get("assessment_id") or doc.id
+            if aid not in seen_assessment_ids:
+                seen_assessment_ids.add(aid)
+                all_assessments.append({
+                    "id": aid,
+                    "created_at": d.get("created_at") or d.get("completed_at"),
+                })
+
+        assessment_stats.total = len(all_assessments)
+
+        for a in all_assessments:
+            created = _to_utc_datetime(a.get("created_at"))
+            if not created:
                 continue
 
             if created >= today_start:
@@ -381,15 +398,8 @@ async def get_dashboard_stats(
         emotion_stats.total = len(emotions)
 
         for e in emotions:
-            created = e.get("created_at")
-            if isinstance(created, str):
-                try:
-                    created = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                except:
-                    continue
-            elif hasattr(created, 'to_datetime'):
-                created = created.to_datetime()
-            else:
+            created = _to_utc_datetime(e.get("created_at"))
+            if not created:
                 continue
 
             if created >= today_start:
@@ -411,15 +421,8 @@ async def get_dashboard_stats(
         scores = []
 
         for b in burnout_results:
-            created = b.get("created_at")
-            if isinstance(created, str):
-                try:
-                    created = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                except:
-                    continue
-            elif hasattr(created, 'to_datetime'):
-                created = created.to_datetime()
-            else:
+            created = _to_utc_datetime(b.get("created_at"))
+            if not created:
                 continue
 
             if created >= today_start:
@@ -875,6 +878,7 @@ class BurnoutAnalyticsResponse(BaseModel):
     avg_reduced_accomplishment: Optional[float]
     burnout_trend: List[DailyTrendResponse]
     high_risk_users: List[Dict[str, Any]]
+    top_stressors: Optional[List[Dict[str, Any]]] = None
 
 
 class LoginAnalyticsResponse(BaseModel):
@@ -1030,18 +1034,37 @@ async def get_assessment_analytics(
     """Lấy assessment analytics chi tiết."""
     db = get_firebase().db
 
-    # Get all assessments
-    assessments = [doc.to_dict() | {"id": doc.id} for doc in db.collection("assessments").stream()]
+    # Get all assessments from assessments and survey_history
+    seen_ids = set()
+    assessments = []
+
+    for doc in db.collection("assessments").stream():
+        d = doc.to_dict() | {"id": doc.id}
+        aid = d.get("id") or doc.id
+        seen_ids.add(aid)
+        assessments.append(d)
+
+    for doc in db.collection("survey_history").stream():
+        d = doc.to_dict() | {"id": doc.id}
+        aid = d.get("assessment_id") or doc.id
+        if aid not in seen_ids:
+            seen_ids.add(aid)
+            assessments.append({
+                "id": aid,
+                "user_id": d.get("user_id"),
+                "status": d.get("status", "completed"),
+                "created_at": d.get("created_at") or d.get("completed_at"),
+            })
 
     # Status distribution
     status_dist: Dict[str, int] = {}
     for a in assessments:
-        status = a.get("status", "unknown")
+        status = a.get("status", "completed")
         status_dist[status] = status_dist.get(status, 0) + 1
 
     # Completion rate
-    completed = sum(1 for a in assessments if a.get("status") == "completed")
-    completion_rate = round(completed / len(assessments) * 100, 1) if assessments else 0
+    completed = sum(1 for a in assessments if a.get("status") in ["completed", "done"])
+    completion_rate = round(completed / len(assessments) * 100, 1) if assessments else 100.0
 
     # Trend
     assessments_trend = _get_daily_trend(assessments, "created_at")
@@ -1183,6 +1206,39 @@ async def get_burnout_analytics(
     # Get all burnout results
     results = [doc.to_dict() | {"id": doc.id} for doc in db.collection("burnout_results").stream()]
 
+    # Also include survey_history records if not already represented
+    existing_user_dates = {(r.get("user_id"), str(r.get("created_at"))[:10]) for r in results}
+    for doc in db.collection("survey_history").stream():
+        d = doc.to_dict() | {"id": doc.id}
+        uid = d.get("user_id")
+        created = d.get("created_at") or d.get("completed_at")
+        date_key = str(created)[:10] if created else ""
+        if (uid, date_key) not in existing_user_dates:
+            ar = d.get("analysis_result") or {}
+            score = ar.get("risk_score")
+            risk = ar.get("risk_level")
+            # If STA survey exists without explicit risk_score, compute from exhaustion
+            if score is None and "survey" in d:
+                raw_s = d["survey"]
+                ex_dict = raw_s.get("exhaustion") or {}
+                if ex_dict:
+                    vals = [float(v) for v in ex_dict.values() if v is not None]
+                    if vals:
+                        avg_ex = sum(vals) / len(vals)
+                        score = round((avg_ex / 5.0) * 100, 1)
+                        risk = "critical" if avg_ex >= 3.8 else ("high" if avg_ex >= 3.2 else ("medium" if avg_ex >= 2.5 else "low"))
+            if score is not None:
+                results.append({
+                    "id": d["id"],
+                    "user_id": uid,
+                    "burnout_score": score,
+                    "risk_level": risk or "low",
+                    "created_at": created,
+                    "survey": d.get("survey"),
+                    "analysis_result": ar,
+                })
+                existing_user_dates.add((uid, date_key))
+
     # Score distribution (histogram)
     score_ranges = [
         ("0-20", 0, 20),
@@ -1217,16 +1273,27 @@ async def get_burnout_analytics(
     # Trend
     burnout_trend = _get_daily_trend(results, "created_at")
 
-    # High risk users
-    high_risk = []
+    # Group by user_id -> ONLY the LATEST assessment for each user
+    user_latest: Dict[str, Dict] = {}
     for r in results:
+        uid = r.get("user_id")
+        if not uid:
+            continue
+        c_at = str(r.get("created_at") or "")
+        if uid not in user_latest or c_at > str(user_latest[uid].get("created_at") or ""):
+            user_latest[uid] = r
+
+    # High risk users (from latest assessment per user)
+    high_risk = []
+    for uid, r in user_latest.items():
         risk = r.get("risk_level", "")
         if risk in ["high", "critical"]:
-            uid = r.get("user_id", "")
             user_info = _get_user_info_simple(db, uid)
             high_risk.append({
                 "user_id": uid,
                 "username": user_info.get("username", "Unknown"),
+                "full_name": user_info.get("full_name") or user_info.get("username", "Unknown"),
+                "avatar_url": user_info.get("avatar_url"),
                 "burnout_score": r.get("burnout_score", 0),
                 "risk_level": risk,
                 "last_assessment": _format_datetime(r.get("created_at")) or ""
@@ -1234,6 +1301,200 @@ async def get_burnout_analytics(
 
     high_risk.sort(key=lambda x: x["burnout_score"], reverse=True)
     high_risk = high_risk[:10]
+
+    # Top Stressors Ranking (from latest assessment per user)
+    stressors_def = [
+        {
+            "id": "workload",
+            "title": "Khối lượng công việc quá tải",
+            "category": "Yêu cầu công việc (Job Demands)",
+            "users": [],
+            "scores": [],
+        },
+        {
+            "id": "recovery_sleep",
+            "title": "Thiếu ngủ & Hồi phục kém",
+            "category": "Khả năng hồi phục (Recovery)",
+            "users": [],
+            "scores": [],
+        },
+        {
+            "id": "time_pressure",
+            "title": "Áp lực thời hạn / Deadline",
+            "category": "Áp lực tiến độ (Pace & Deadlines)",
+            "users": [],
+            "scores": [],
+        },
+        {
+            "id": "emotional_demands",
+            "title": "Căng thẳng & Áp lực cảm xúc",
+            "category": "Sức khỏe tâm lý (Emotional Strain)",
+            "users": [],
+            "scores": [],
+        },
+        {
+            "id": "disengagement",
+            "title": "Mất gắn kết & Giảm động lực",
+            "category": "Động lực làm việc (Disengagement)",
+            "users": [],
+            "scores": [],
+        },
+        {
+            "id": "custom_overload",
+            "title": "Nguyên nhân khác (User trải lòng)",
+            "category": "Phản hồi trực tiếp từ nhân sự",
+            "users": [],
+            "scores": [],
+        },
+    ]
+
+    total_assessed_users = max(1, len(user_latest))
+
+    for uid, r in user_latest.items():
+        user_info = _get_user_info_simple(db, uid)
+        u_name = user_info.get("username", "Unknown")
+        f_name = user_info.get("full_name") or u_name
+        avatar = user_info.get("avatar_url")
+        c_at_str = _format_datetime(r.get("created_at")) or ""
+
+        survey = r.get("survey") or {}
+        context = r.get("context") or {}
+        sta = r.get("sta_core") or {}
+        primary = str(r.get("primary_factor") or "")
+
+        reasons = list(survey.get("overload_reasons") or [])
+        if isinstance(survey.get("quick_overload_data"), dict):
+            reasons = reasons or list(survey["quick_overload_data"].get("overload_reasons") or [])
+
+        other_note = survey.get("other_overload_reason") or ""
+        for reason_item in reasons:
+            if "Khác" in str(reason_item) and "(" in str(reason_item):
+                extracted = str(reason_item).split("(", 1)[1].rstrip(")")
+                if extracted:
+                    other_note = extracted
+
+        # Workload check
+        jd_dict = survey.get("job_demands") or {}
+        jd1 = float(jd_dict.get("jd1") or 0)
+        jd_mean = float(jd_dict.get("score") or 0)
+        workload_score = jd1 or jd_mean or (4.5 if any("nhiều việc" in str(x).lower() for x in reasons) else 0)
+        if workload_score >= 3.5 or any("nhiều việc" in str(x).lower() for x in reasons) or primary == "workload":
+            score_val = round(workload_score if workload_score > 0 else 4.0, 1)
+            stressors_def[0]["users"].append({
+                "user_id": uid,
+                "username": u_name,
+                "full_name": f_name,
+                "avatar_url": avatar,
+                "score": score_val,
+                "level": "critical" if score_val >= 4.0 else "high",
+                "last_assessment": c_at_str,
+                "notes": "Báo cáo khối lượng công việc vượt mức khả năng xử lý"
+            })
+            stressors_def[0]["scores"].append(score_val)
+
+        # Recovery & Sleep check
+        sleep_h = float(survey.get("sleep_hours") or (context.get("recovery") or {}).get("sleep_hours") or 8.0)
+        rec_score = float(survey.get("recovery_score") or (context.get("recovery") or {}).get("recovery_perception") or 3.0)
+        if sleep_h < 6.0 or rec_score <= 2.0 or any("ngủ" in str(x).lower() or "mệt" in str(x).lower() for x in reasons) or primary in ["sleep", "recovery"]:
+            score_val = round(5.0 - min(4.0, rec_score), 1)
+            stressors_def[1]["users"].append({
+                "user_id": uid,
+                "username": u_name,
+                "full_name": f_name,
+                "avatar_url": avatar,
+                "score": score_val,
+                "level": "critical" if sleep_h < 5.0 or rec_score <= 1.0 else "high",
+                "last_assessment": c_at_str,
+                "notes": f"Ngủ {sleep_h:.1f}h đêm qua, điểm hồi phục: {rec_score:.0f}/5"
+            })
+            stressors_def[1]["scores"].append(score_val)
+
+        # Time Pressure / Deadline check
+        jd2 = float(jd_dict.get("jd2") or 0)
+        deadline_p = str(survey.get("current_deadline_pressure") or "").lower()
+        if jd2 >= 3.5 or deadline_p in ["high", "extreme"] or any("deadline" in str(x).lower() for x in reasons):
+            score_val = round(jd2 if jd2 > 0 else (5.0 if deadline_p == "extreme" else 4.0), 1)
+            stressors_def[2]["users"].append({
+                "user_id": uid,
+                "username": u_name,
+                "full_name": f_name,
+                "avatar_url": avatar,
+                "score": score_val,
+                "level": "critical" if score_val >= 4.5 else "high",
+                "last_assessment": c_at_str,
+                "notes": f"Áp lực tiến độ & thời gian ở mức {deadline_p or 'cao'}"
+            })
+            stressors_def[2]["scores"].append(score_val)
+
+        # Emotional demands
+        ex_dict = survey.get("exhaustion") or {}
+        ex_vals = [float(v) for v in ex_dict.values() if v is not None]
+        avg_ex = (sum(ex_vals) / len(ex_vals)) if ex_vals else float((sta.get("exhaustion") or {}).get("score") or 0)
+        if avg_ex >= 3.5 or any("cảm xúc" in str(x).lower() for x in reasons) or primary == "stress":
+            score_val = round(avg_ex if avg_ex > 0 else 4.0, 1)
+            stressors_def[3]["users"].append({
+                "user_id": uid,
+                "username": u_name,
+                "full_name": f_name,
+                "avatar_url": avatar,
+                "score": score_val,
+                "level": "critical" if score_val >= 4.0 else "high",
+                "last_assessment": c_at_str,
+                "notes": "Mức độ kiệt sức cảm xúc đáng chú ý"
+            })
+            stressors_def[3]["scores"].append(score_val)
+
+        # Disengagement
+        dis_dict = survey.get("disengagement") or {}
+        dis_vals = [float(v) for v in dis_dict.values() if v is not None]
+        avg_dis = (sum(dis_vals) / len(dis_vals)) if dis_vals else float((sta.get("disengagement") or {}).get("score") or 0)
+        if avg_dis >= 3.0 or any("động lực" in str(x).lower() for x in reasons) or primary == "behavior":
+            score_val = round(avg_dis if avg_dis > 0 else 3.5, 1)
+            stressors_def[4]["users"].append({
+                "user_id": uid,
+                "username": u_name,
+                "full_name": f_name,
+                "avatar_url": avatar,
+                "score": score_val,
+                "level": "critical" if score_val >= 4.0 else "high",
+                "last_assessment": c_at_str,
+                "notes": "Có dấu hiệu xa cách hoặc giảm gắn kết công việc"
+            })
+            stressors_def[4]["scores"].append(score_val)
+
+        # Custom overload notes
+        if other_note or any("khác" in str(x).lower() for x in reasons):
+            stressors_def[5]["users"].append({
+                "user_id": uid,
+                "username": u_name,
+                "full_name": f_name,
+                "avatar_url": avatar,
+                "score": 4.5,
+                "level": "high",
+                "last_assessment": c_at_str,
+                "notes": other_note or "Nguyên nhân cá nhân / bối cảnh riêng"
+            })
+            stressors_def[5]["scores"].append(4.5)
+
+    # Format stressors list
+    top_stressors = []
+    for s in stressors_def:
+        cnt = len(s["users"])
+        pct = round((cnt / total_assessed_users) * 100, 1) if user_latest else 0.0
+        avg_sc = round(sum(s["scores"]) / cnt, 1) if cnt > 0 else 0.0
+        s["users"].sort(key=lambda u: u["score"], reverse=True)
+        top_stressors.append({
+            "id": s["id"],
+            "title": s["title"],
+            "category": s["category"],
+            "affected_users_count": cnt,
+            "affected_percentage": pct,
+            "avg_score": avg_sc,
+            "users": s["users"],
+        })
+
+    # Sort stressors by affected_users_count descending
+    top_stressors.sort(key=lambda x: (x["affected_users_count"], x["avg_score"]), reverse=True)
 
     return BurnoutAnalyticsResponse(
         score_distribution=score_dist,
@@ -1243,7 +1504,8 @@ async def get_burnout_analytics(
         avg_depersonalization=None,
         avg_reduced_accomplishment=None,
         burnout_trend=burnout_trend,
-        high_risk_users=high_risk
+        high_risk_users=high_risk,
+        top_stressors=top_stressors,
     )
 
 

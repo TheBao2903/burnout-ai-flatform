@@ -88,15 +88,15 @@ class ConversationStagesService:
 
     # Greeting templates
     GREETING_MESSAGES = [
-        "Xin chao! Rat vui duoc tro chuyen voi ban. Ban cam thay nhu the nao hom nay?",
-        "Chao ban! Toi o day de lang nghe va ho tro ban. Ban muon chia se dieu gi hom nay?",
-        "Chao ban! Cam on da den day. Hay thoai mai chia se nhung gi ban dang trai qua.",
+        "Xin chào! Rất vui được trò chuyện cùng bạn. Hôm nay công việc và tâm trạng của bạn thế nào?",
+        "Chào bạn! Tôi ở đây để lắng nghe và luôn đồng hành cùng bạn. Hãy thoải mái chia sẻ những điều bạn đang bận tâm hôm nay nhé.",
+        "Chào bạn! Cảm ơn bạn đã tìm đến tôi. Hãy trải lòng về những áp lực hay cảm xúc bạn đang trải qua nhé.",
     ]
 
     # Closing templates
     CLOSING_MESSAGES = [
-        "Cam on ban da chia se nhung dieu rất rieng tu. Hay nho rang viec nhan biet va cham soc ban than la rất quan trong. Neu ban can, toi luon o day de lang nghe.",
-        "Cam on ban da tin tuong chia se voi toi. Hay tiep tuc chu y den suc khoe tinh than cua minh nhe. Tam biet va chuc ban mot ngay tot lam!",
+        "Cảm ơn bạn đã tin tưởng chia sẻ những điều rất riêng tư với tôi. Hãy nhớ rằng việc nhận biết và chăm sóc sức khỏe tinh thần của bản thân là cực kỳ quan trọng. Nếu bạn cần, tôi luôn ở đây để lắng nghe.",
+        "Cảm ơn bạn đã chia sẻ cùng tôi. Hãy dành thời gian lắng nghe và nghỉ ngơi phục hồi cơ thể nhé. Chúc bạn một ngày nhẹ nhàng và bình an!",
     ]
 
     def __init__(self):
@@ -131,12 +131,12 @@ class ConversationStagesService:
             if summary.get("key_points"):
                 points = summary["key_points"]
                 if points:
-                    message = message + "\n\nTom tat nhung dieu chung ta da thao luan: " + points[0] + "."
+                    message = message + "\n\n📋 Tóm tắt nội dung trao đổi: " + points[0] + "."
 
             if summary.get("recommendations"):
                 recs = summary["recommendations"]
                 if recs:
-                    message = message + "\n\nGoỵ y cho ban: " + recs[0] + "."
+                    message = message + "\n\n💡 Gợi ý hành động cho bạn: " + recs[0] + "."
 
         return message
 
@@ -146,23 +146,28 @@ class ConversationStagesService:
         message_count: int,
         analysis_context: dict,
     ) -> tuple[bool, Optional[str]]:
-        """Determine if conversation should wrap up."""
+        """Determine if conversation should wrap up based on STA session discipline."""
         stage = self.get_current_stage(assessment_id, message_count)
 
         if stage == ConversationStage.WRAPPING_UP:
-            return True, "Da dat den giai doan ket thuc tu nhien cua cuoc tro chuyen."
+            return True, "Đã đạt đến giai đoạn kết thúc tự nhiên của cuộc trò chuyện."
 
         burnout_score = analysis_context.get("burnout_score", 0)
         stress_score = analysis_context.get("stress_score", 0)
 
-        if burnout_score > 80 or stress_score > 85:
-            return False, None
+        # Ngăn đóng phiên đột ngột nếu người dùng đang có dấu hiệu căng thẳng cực đoan (cần an ủi thêm)
+        if burnout_score > 85 or stress_score > 90:
+            if message_count < 8:
+                return False, None
 
-        if stage == ConversationStage.COPING and message_count >= 8:
-            return True, "Da co du thong tin de tom tat va dua ra goỵ y."
+        # STA Elastic 4+2 Discipline:
+        # Lượt 4: Cổng đánh giá kết thúc sớm nếu đã đủ dữ liệu
+        if message_count >= 4 and stage in [ConversationStage.COPING, ConversationStage.WRAPPING_UP]:
+            return True, "Đã có đủ dữ liệu bối cảnh và đưa ra hành động hỗ trợ phù hợp."
 
-        if message_count >= 12:
-            return True, "Cuoc tro chuyen da keo dai, hay tom tat."
+        # Lượt 6: Trần cứng bắt buộc kết thúc phiên
+        if message_count >= 6:
+            return True, "Phiên trò chuyện đã đạt giới hạn tối ưu (Trần Lượt 6), tiến hành tổng hợp để người dùng nghỉ ngơi."
 
         return False, None
 
@@ -177,33 +182,33 @@ class ConversationStagesService:
 
         if analysis_context.get("detected_signals"):
             signals = analysis_context["detected_signals"][:3]
-            key_points.append("Ban dang trai qua: " + ", ".join(signals))
+            key_points.append("Tín hiệu ghi nhận: " + ", ".join(signals))
 
         if analysis_context.get("stress_score", 0) > 60:
-            key_points.append("Muc do stress dang chu y can duoc quan ly")
-            recommendations.append("Hay thuc hanh cac bai tap thở va thien de giam stress")
+            key_points.append("Mức độ căng thẳng đáng chú ý cần được quan tâm điều hòa")
+            recommendations.append("Thực hành bài tập thở sâu hoặc thư giãn cơ bắp ngắn hạn")
 
         if analysis_context.get("burnout_score", 0) > 50:
-            key_points.append("Co dau hieu burnout can duoc chu y")
-            recommendations.append("Uu tien nghi ngoi va can bang cuoc song")
+            key_points.append("Có tín hiệu kiệt sức công việc cần được theo dõi chủ động")
+            recommendations.append("Ưu tiên nghỉ ngơi và ngắt kết nối khỏi các thiết bị công việc sau giờ làm")
 
         if analysis_context.get("fatigue_score", 0) > 60:
-            recommendations.append("Dam bao ngu du 7-8 tieng moi dem")
+            recommendations.append("Đảm bảo giấc ngủ đủ và chất lượng để cơ thể hồi phục")
 
         user_messages = [m for m in conversation_history if m.get("role") == "user"]
         if len(user_messages) < 3:
-            recommendations.append("Hay tiep tuc chia se de chung ta hieu ro hon ve tinh trang cua ban")
+            recommendations.append("Duy trì việc theo dõi năng lượng đều đặn mỗi ngày")
 
         if analysis_context.get("burnout_score", 0) > 70:
-            overall = "Muc do burnout nghiem trong - nen tim kiem ho tro chuyen nghiep"
+            overall = "Tín hiệu kiệt sức ở mức cao - Hãy ưu tiên giảm tải và trao đổi cùng người có chuyên môn"
         elif analysis_context.get("burnout_score", 0) > 50:
-            overall = "Co dau hieu burnout can duoc theo doi va quan ly"
+            overall = "Có tín hiệu kiệt sức cần lưu ý theo dõi và điều chỉnh nhịp làm việc"
         else:
-            overall = "Tinh trang o muc co the quan ly duoc"
+            overall = "Trạng thái năng lượng hiện tại đang ở mức ổn định"
 
         return {
-            "key_points": key_points if key_points else ["Chua co thong tin du de tom tat"],
-            "recommendations": recommendations if recommendations else ["Tiep tuc cham soc suc khoe tinh than"],
+            "key_points": key_points if key_points else ["Chưa có đủ thông tin để tóm tắt chi tiết"],
+            "recommendations": recommendations if recommendations else ["Tiếp tục duy trì chăm sóc sức khỏe tinh thần"],
             "overall_assessment": overall,
         }
 

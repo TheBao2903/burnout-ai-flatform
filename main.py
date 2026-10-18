@@ -13,6 +13,7 @@ Luu y:
 """
 
 import logging
+import os
 import pathlib
 import sys
 from contextlib import asynccontextmanager
@@ -69,7 +70,14 @@ async def lifespan(app: FastAPI):
     logger.info("Environment: %s", settings.server.environment)
 
     try:
-        init_firebase()
+        cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "config/serviceAccountKey.json"
+        abs_cred_path = pathlib.Path(cred_path)
+        if not abs_cred_path.is_absolute():
+            abs_cred_path = _ROOT / cred_path
+        if abs_cred_path.exists():
+            init_firebase(credential_path=str(abs_cred_path))
+        else:
+            init_firebase()
         logger.info("Firebase initialized")
     except Exception as exc:
         logger.warning("Firebase init failed: %s. App continues without Firestore.", exc)
@@ -83,36 +91,41 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down...")
 
 
+_DEEPFACE_READY = False
+
+
 def _preload_deepface():
-    """Preload DeepFace models on startup to avoid slow first request."""
+    """Kiểm tra môi trường và preload DeepFace Emotion model."""
+    global _DEEPFACE_READY
     import os
     import warnings
     warnings.filterwarnings('ignore')
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+    os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
-    preloaded_marker = "/root/.deepface/weights/.preloaded"
-    if os.path.exists(preloaded_marker):
-        logger.info("DeepFace models already preloaded")
+    # 1. Kiem tra TensorFlow
+    try:
+        import tensorflow as tf
+    except ImportError:
+        logger.error("=" * 65)
+        logger.error("!!! CANH BAO MOI TRUONG RUNTIME !!!")
+        logger.error("TensorFlow khong tim thay trong Python hien tai (%s).", sys.executable)
+        logger.error("HAY CHAY SERVER BANG MOI TRUONG AO .VENV:")
+        logger.error("  .\\.venv\\Scripts\\python.exe -m uvicorn main:app --reload --port 8000")
+        logger.error("=" * 65)
+        _DEEPFACE_READY = False
         return
 
+    # 2. Preload Emotion Model
     try:
-        from deepface import DeepFace
-        logger.info("Preloading DeepFace models...")
-
-        models_to_preload = ["Emotion", "Age", "Gender"]
-        for model_name in models_to_preload:
-            logger.info("  Loading %s model...", model_name)
-            DeepFace.build_model(model_name=model_name)
-
-        # Create marker
-        os.makedirs("/root/.deepface/weights", exist_ok=True)
-        with open(preloaded_marker, "w") as f:
-            f.write("preloaded\n")
-
-        logger.info("DeepFace models preloaded successfully")
+        from deepface.models.demography import Emotion
+        logger.info("Preloading DeepFace Emotion model...")
+        Emotion.load_model()
+        _DEEPFACE_READY = True
+        logger.info("DeepFace Emotion model loaded successfully - Ready for fast inference")
     except Exception as e:
         logger.warning("DeepFace preload warning: %s", e)
-        logger.warning("Models will be downloaded on first use (slower first request)")
+        _DEEPFACE_READY = False
 
 
 # ==========================================
@@ -183,6 +196,8 @@ async def health_check():
         "status": "healthy",
         "service": "burnout-ai-platform",
         "version": "1.0.0",
+        "python_version": sys.version.split()[0],
+        "deepface_ready": _DEEPFACE_READY,
     }
 
 

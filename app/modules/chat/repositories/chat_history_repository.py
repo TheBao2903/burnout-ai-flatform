@@ -47,6 +47,7 @@ class ChatHistoryRepository:
         analysis: Optional[Dict[str, Any]] = None,
         ai_model: Optional[str] = None,
         session_id: Optional[str] = None,
+        client_message_id: Optional[str] = None,
     ) -> str:
         """Lưu một tin nhắn chat vào Firestore.
 
@@ -58,6 +59,8 @@ class ChatHistoryRepository:
             analysis: Optional GPT analysis dict (sẽ convert sang ChatAnalysis).
             ai_model: Tên model AI đã sử dụng.
             session_id: Optional session ID (nullable cho backward compatibility).
+            client_message_id: Idempotency key từ client (Q5). Dùng để detect
+                duplicate request. Nếu None, không enforce idempotency.
 
         Returns:
             Document id.
@@ -95,13 +98,40 @@ class ChatHistoryRepository:
         # session_id is nullable - only add if provided (backward compatible)
         if session_id:
             data["session_id"] = session_id
+        # Q5: Idempotency key
+        if client_message_id:
+            data["client_message_id"] = client_message_id
         doc_ref.set(data)
 
         logger.info(
-            "Saved chat message %s for assessment %s (role=%s, has_analysis=%s)",
-            doc_ref.id, assessment_id, role, bool(analysis),
+            "Saved chat message %s for assessment %s (role=%s, has_analysis=%s, client_msg_id=%s)",
+            doc_ref.id, assessment_id, role, bool(analysis), bool(client_message_id),
         )
         return doc_ref.id
+
+    def get_by_client_message_id(
+        self,
+        assessment_id: str,
+        client_message_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Tìm message trong assessment theo client_message_id.
+
+        Dùng cho Q5 idempotency: nếu client retry request cùng ID,
+        trả về message cũ thay vì xử lý lại.
+        """
+        if not client_message_id:
+            return None
+        query = (
+            self.collection
+            .where("assessment_id", "==", assessment_id)
+            .where("client_message_id", "==", client_message_id)
+            .limit(1)
+        )
+        for doc in query.stream():
+            data = doc.to_dict() or {}
+            data["id"] = doc.id
+            return data
+        return None
 
     def get_messages_by_assessment(
         self,

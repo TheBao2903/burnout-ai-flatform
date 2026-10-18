@@ -102,18 +102,64 @@ class GoogleAISettings(BaseSettings):
     api_key: str = Field(
         default="",
         validation_alias=AliasChoices("GOOGLE_API_KEY"),
-        description="Google AI Studio API key",
+        description="Google AI Studio API key chính",
+    )
+    api_key_2: str = Field(
+        default="",
+        validation_alias=AliasChoices("GOOGLE_API_KEY_2"),
+        description="Google AI Studio API key dự phòng 2",
+    )
+    api_key_3: str = Field(
+        default="",
+        validation_alias=AliasChoices("GOOGLE_API_KEY_3"),
+        description="Google AI Studio API key dự phòng 3",
+    )
+    api_key_4: str = Field(
+        default="",
+        validation_alias=AliasChoices("GOOGLE_API_KEY_4"),
+        description="Google AI Studio API key dự phòng 4",
+    )
+    api_key_5: str = Field(
+        default="",
+        validation_alias=AliasChoices("GOOGLE_API_KEY_5"),
+        description="Google AI Studio API key dự phòng 5",
     )
     model: str = Field(
-        default="gemini-2.0-flash",
+        default="gemini-3.8-flash",
         validation_alias=AliasChoices("GEMINI_MODEL"),
-        description="Model Gemini su dung (set GEMINI_MODEL in .env)",
+        description="Model Gemini su dung mac dinh",
+    )
+    models_csv: str = Field(
+        default="gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash-lite",
+        validation_alias=AliasChoices("GEMINI_MODELS"),
+        description="Danh sach cac model xoay vong cach nhau boi dau phay",
     )
     timeout_seconds: int = Field(
         default=20,
         validation_alias=AliasChoices("GEMINI_TIMEOUT_SECONDS"),
         description="Timeout goi API (seconds)",
     )
+
+    @property
+    def api_keys(self) -> list[str]:
+        """Danh sach tat ca API keys hop le, khong trung lap va khong rong."""
+        candidates = [self.api_key, self.api_key_2, self.api_key_3, self.api_key_4, self.api_key_5]
+        seen = set()
+        valid = []
+        for k in candidates:
+            k_clean = (k or "").strip()
+            if k_clean and k_clean not in seen and not k_clean.startswith("YOUR_"):
+                seen.add(k_clean)
+                valid.append(k_clean)
+        return valid
+
+    @property
+    def model_pool(self) -> list[str]:
+        """Danh sach cac model theo thu tu uu tien xoay vong."""
+        raw_list = [m.strip() for m in self.models_csv.split(",") if m.strip()]
+        if not raw_list:
+            return [self.model]
+        return raw_list
 
 
 class GoogleAIEmbedSettings(BaseSettings):

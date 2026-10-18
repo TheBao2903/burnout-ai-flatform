@@ -2,7 +2,7 @@
 ==============================================================
 Helpers Package
 
-Chứa các pure functions, constants và models dùng chung.
+Chứa các pure functions, constants và models dùng chung cho Burnout Engine.
 ==============================================================
 """
 
@@ -18,6 +18,9 @@ from app.modules.burnout.helpers.models import (
 
 # Scoring
 from app.modules.burnout.helpers.scoring import (
+    calculate_mean_score,
+    calculate_recovery_status,
+    calculate_dimension_trend,
     calculate_sleep_score,
     calculate_workload_score,
     calculate_stress_score,
@@ -27,16 +30,21 @@ from app.modules.burnout.helpers.scoring import (
     TREND_BONUS,
 )
 
-# Completeness
+# Completeness & Sufficiency
 from app.modules.burnout.helpers.completeness import (
+    evaluate_data_sufficiency,
+    evaluate_data_quality,
     calculate_data_completeness,
     calculate_data_completeness_from_analysis,
     calculate_evidence_coverage,
     DATA_COMPLETENESS_WEIGHTS,
 )
 
-# Weights
+# Weights & Thresholds
 from app.modules.burnout.helpers.weights import (
+    LIKERT_CUTOFFS,
+    get_dimension_level,
+    get_burnout_signal_status,
     BURNOUT_WEIGHTS,
     RISK_THRESHOLDS,
     get_risk_level,
@@ -53,7 +61,16 @@ __all__ = [
     "HistoricalTrend",
     "FactorContribution",
     "FactorAnalysis",
-    # Scoring
+    # STA Scoring
+    "calculate_mean_score",
+    "calculate_recovery_status",
+    "calculate_dimension_trend",
+    "evaluate_data_sufficiency",
+    "evaluate_data_quality",
+    "LIKERT_CUTOFFS",
+    "get_dimension_level",
+    "get_burnout_signal_status",
+    # Legacy Scoring
     "calculate_sleep_score",
     "calculate_workload_score",
     "calculate_stress_score",

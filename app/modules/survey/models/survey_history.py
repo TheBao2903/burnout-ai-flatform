@@ -2,467 +2,420 @@
 ==============================================================
 File: survey_history.py
 
-Survey History Models - Lưu lịch sử survey theo assessment.
+Survey History Models - Lưu lịch sử survey theo chuẩn khoa học (STA).
 
-CLEAN ARCHITECTURE - Theo thiết kế:
-- Survey CHỉ lưu raw answers (user input)
-- KHÔNG lưu analysis_result (thuộc BurnoutResult)
-- KHÔNG lưu recommendations (thuộc Recommendation Engine)
+MÔ HÌNH THIẾT KẾ:
+1. Daily Check-in (Tối đa ~12 câu/ngày):
+   - Exhaustion (OLBI): E1 - E3 (Thang 1-5)
+   - Disengagement (OLBI): D1 - D3 (Thang 1-5)
+   - Job Demands (JD-R): JD1 - JD3 (Thang 1-5)
+   - Sleep: Số giờ ngủ đêm qua (float)
+   - Recovery: Cảm nhận hồi phục sau khi ngủ/nghỉ ngơi (Thang 1-5)
+   - Quick Overload: Đánh giá quá tải hôm nay (Thang 1-5) + lý do nếu chọn 4-5
+   - Daily Work Changes: Làm thêm hôm nay (giờ) + Áp lực deadline hôm nay
 
-Collection: FirestoreCollections.SURVEY_HISTORY ("survey_history").
-Mỗi assessment chỉ có một survey record.
+2. Periodic Survey (Khảo sát định kỳ môi trường làm việc - Không làm mỗi ngày):
+   - Job Resources (JD-R): JR1 - JR4 (Thang 1-5)
+   - Six Areas of Worklife: Workload, Control, Reward, Community, Fairness, Values (Thang 1-5)
+
+Collection:
+- surveys: Daily check-in records gắn với assessment_id & user_id
+- periodic_surveys: Periodic survey records gắn với user_id
 ==============================================================
 """
 
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ==========================================
-# Survey Data Groups (Logical Organization)
+# Daily Check-in Dimension Groups
 # ==========================================
 
-class SleepGroup(BaseModel):
-    """Sleep-related survey fields."""
+class ExhaustionGroup(BaseModel):
+    """Exhaustion dimension (OLBI core) - Thang 1-5."""
+    e1: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="E1. Hôm nay tôi cảm thấy khó duy trì năng lượng để tiếp tục công việc."
+    )
+    e2: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="E2. Hôm nay công việc khiến tôi cảm thấy mình đã tiêu hao rất nhiều năng lượng."
+    )
+    e3: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="E3. Sau khi kết thúc công việc hôm nay, tôi vẫn khó lấy lại sức."
+    )
+
+    def mean_score(self) -> Optional[float]:
+        vals = [v for v in [self.e1, self.e2, self.e3] if v is not None]
+        return sum(vals) / len(vals) if vals else None
+
+
+class DisengagementGroup(BaseModel):
+    """Disengagement dimension (OLBI core) - Thang 1-5."""
+    d1: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="D1. Hôm nay tôi muốn tránh hoặc hạn chế những việc liên quan đến công việc."
+    )
+    d2: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="D2. Hôm nay tôi cảm thấy mình ít quan tâm đến công việc hơn bình thường."
+    )
+    d3: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="D3. Hôm nay tôi cảm thấy công việc của mình ít có ý nghĩa hơn bình thường."
+    )
+
+    def mean_score(self) -> Optional[float]:
+        vals = [v for v in [self.d1, self.d2, self.d3] if v is not None]
+        return sum(vals) / len(vals) if vals else None
+
+
+class JobDemandsGroup(BaseModel):
+    """Job Demands dimension (JD-R) - Thang 1-5."""
+    jd1: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="JD1. Hôm nay tôi có quá nhiều việc phải hoàn thành."
+    )
+    jd2: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="JD2. Hôm nay tôi phải hoàn thành công việc trong thời gian quá ngắn."
+    )
+    jd3: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="JD3. Hôm nay tôi phải xử lý nhiều việc cùng lúc."
+    )
+
+    def mean_score(self) -> Optional[float]:
+        vals = [v for v in [self.jd1, self.jd2, self.jd3] if v is not None]
+        return sum(vals) / len(vals) if vals else None
+
+
+class RecoveryGroup(BaseModel):
+    """Recovery dimension - Sleep hours & recovery perception."""
     sleep_hours: Optional[float] = Field(
         default=None, ge=0.0, le=24.0,
-        description="Số giờ ngủ trung bình"
+        description="Đêm qua bạn ngủ khoảng bao nhiêu giờ?"
+    )
+    recovery_score: Optional[int] = Field(
+        default=None, ge=1, le=5,
+        description="Hôm nay bạn cảm thấy mình đã hồi phục như thế nào? (1: Chưa hồi phục -> 5: Hồi phục tốt)"
     )
 
 
-class WorkloadGroup(BaseModel):
-    """Workload-related survey fields."""
-    working_hours: Optional[float] = Field(
-        default=None, ge=0.0, le=24.0,
-        description="Số giờ làm việc/ngày"
+class QuickOverloadGroup(BaseModel):
+    """Quick Overload check-in."""
+    quick_overload: Optional[int] = Field(
+        default=None, ge=1, le=5,
+        description="Hôm nay công việc có khiến bạn cảm thấy quá tải không? (1-5)"
     )
-    overtime_hours: Optional[int] = Field(
-        default=None, ge=0, le=24,
-        description="Số giờ tăng ca/tuần"
-    )
-    work_days_per_week: Optional[int] = Field(
-        default=None, ge=1, le=7,
-        description="Số ngày làm việc/tuần"
-    )
-    consecutive_work_days: Optional[int] = Field(
-        default=None, ge=0, le=30,
-        description="Số ngày làm việc liên tục"
-    )
-    rest_days: Optional[int] = Field(
-        default=None, ge=0, le=7,
-        description="Số ngày nghỉ/tuần"
+    overload_reasons: List[str] = Field(
+        default_factory=list,
+        description="Lý do quá tải nếu quick_overload >= 4 (Quá nhiều việc, Áp lực deadline, v.v.)"
     )
 
 
-class PsychologicalGroup(BaseModel):
-    """Psychological-related survey fields."""
-    stress_level: Optional[int] = Field(
-        default=None, ge=1, le=10,
-        description="Mức độ stress tự đánh giá (1-10)"
-    )
-    motivation_level: Optional[int] = Field(
-        default=None, ge=1, le=10,
-        description="Mức độ động lực (1-10)"
-    )
-    work_satisfaction: Optional[int] = Field(
-        default=None, ge=1, le=10,
-        description="Mức độ hài lòng công việc (1-10)"
-    )
-
-
-class WorkPressureGroup(BaseModel):
-    """Work pressure-related survey fields."""
-    has_deadline: Optional[Literal["low", "medium", "high", "extreme"]] = Field(
+class DailyWorkChangesGroup(BaseModel):
+    """Biến động công việc trong ngày."""
+    has_overtime_today: Optional[bool] = Field(
         default=None,
-        description="Mức độ deadline: low/medium/high/extreme"
+        description="Hôm nay bạn có làm thêm giờ không?"
     )
-
-
-class PhysiologicalGroup(BaseModel):
-    """Physiological-related survey fields."""
-    heart_rate: Optional[int] = Field(
-        default=None, ge=30, le=220,
-        description="Nhịp tim (bpm)"
+    overtime_hours_today: Optional[float] = Field(
+        default=None, ge=0.0, le=24.0,
+        description="Số giờ tăng ca hôm nay"
+    )
+    current_deadline_pressure: Optional[Literal["low", "medium", "high", "extreme"]] = Field(
+        default=None,
+        description="Áp lực deadline hiện tại (low, medium, high, extreme)"
     )
 
 
 # ==========================================
-# Main Survey Data Model
+# Main Daily Survey Data Model
 # ==========================================
 
 class SurveyData(BaseModel):
-    """Dữ liệu survey chuẩn - CHỈ raw answers.
-
-    KHÔNG chứa:
-    - analysis_result (thuộc BurnoutResult)
-    - recommendations (thuộc Recommendation Engine)
-
-    Fields được nhóm theo domain logic:
-    - Sleep: sleep_hours
-    - Workload: working_hours, overtime_hours, work_days_per_week, consecutive_work_days, rest_days
-    - Psychological: stress_level, motivation_level, work_satisfaction
-    - Work Pressure: has_deadline
-    - Physiological: heart_rate
-    """
-
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "sleep_hours": 5.5,
-                "working_hours": 10.0,
-                "overtime_hours": 3,
-                "has_deadline": "high",
-                "work_days_per_week": 6,
-                "stress_level": 8,
-                "motivation_level": 3
-            }
-        }
-    )
-
-    # Sleep Group
-    sleep_hours: Optional[float] = Field(
-        default=None, ge=0.0, le=24.0,
-        description="Số giờ ngủ trung bình"
-    )
-
-    # Workload Group
-    working_hours: Optional[float] = Field(
-        default=None, ge=0.0, le=24.0,
-        description="Số giờ làm việc/ngày"
-    )
-    overtime_hours: Optional[int] = Field(
-        default=None, ge=0, le=24,
-        description="Số giờ tăng ca/tuần"
-    )
-    work_days_per_week: Optional[int] = Field(
-        default=None, ge=1, le=7,
-        description="Số ngày làm việc/tuần"
-    )
-    consecutive_work_days: Optional[int] = Field(
-        default=None, ge=0, le=30,
-        description="Số ngày làm việc liên tục"
-    )
-    rest_days: Optional[int] = Field(
-        default=None, ge=0, le=7,
-        description="Số ngày nghỉ/tuần"
-    )
-
-    # Psychological Group
-    stress_level: Optional[int] = Field(
-        default=None, ge=1, le=10,
-        description="Mức độ stress tự đánh giá (1-10)"
-    )
-    motivation_level: Optional[int] = Field(
-        default=None, ge=1, le=10,
-        description="Mức độ động lực (1-10)"
-    )
-    work_satisfaction: Optional[int] = Field(
-        default=None, ge=1, le=10,
-        description="Mức độ hài lòng công việc (1-10)"
-    )
-
-    # Work Pressure Group
-    has_deadline: Optional[Literal["low", "medium", "high", "extreme"]] = Field(
-        default=None,
-        description="Mức độ deadline: low/medium/high/extreme"
-    )
-
-    # Physiological Group
-    heart_rate: Optional[int] = Field(
-        default=None, ge=30, le=220,
-        description="Nhịp tim (bpm)"
-    )
-
-    # Metadata
-    survey_version: str = Field(
-        default="v1.0",
-        description="Phiên bản survey schema"
-    )
-    submitted_at: Optional[datetime] = Field(
-        default=None,
-        description="Thời điểm submit"
-    )
-
-    # ==========================================
-    # Field Availability Checkers
-    # ==========================================
-
-    def has_sleep_data(self) -> bool:
-        """Check if sleep data is available."""
-        return self.sleep_hours is not None
-
-    def has_workload_data(self) -> bool:
-        """Check if workload data is available (any workload field)."""
-        return any([
-            self.working_hours is not None,
-            self.overtime_hours is not None,
-            self.work_days_per_week is not None,
-            self.has_deadline is not None,
-        ])
-
-    def has_stress_data(self) -> bool:
-        """Check if stress data is available."""
-        return self.stress_level is not None
-
-    def has_psychological_data(self) -> bool:
-        """Check if any psychological data is available."""
-        return any([
-            self.stress_level is not None,
-            self.motivation_level is not None,
-            self.work_satisfaction is not None,
-        ])
-
-    def has_physiological_data(self) -> bool:
-        """Check if physiological data is available."""
-        return self.heart_rate is not None
-
-    def has_any_data(self) -> bool:
-        """Check if any survey data is available."""
-        return any([
-            self.has_sleep_data(),
-            self.has_workload_data(),
-            self.has_psychological_data(),
-            self.has_physiological_data(),
-        ])
-
-    def get_available_fields(self) -> list[str]:
-        """Get list of available field names."""
-        fields = []
-        for field_name, value in self.model_dump(exclude_none=True).items():
-            if value is not None and field_name not in ['survey_version', 'submitted_at']:
-                fields.append(field_name)
-        return fields
-
-
-class SurveyHistoryRecord(BaseModel):
-    """Lịch sử survey của một assessment - CLEAN VERSION.
-
-    CHỈ lưu:
-    - assessment_id, user_id (FK)
-    - survey data (raw answers)
-    - status, timestamps
-
-    KHÔNG lưu:
-    - analysis_result (thuộc BurnoutResult)
-    - recommendations (thuộc Recommendation Engine)
-    """
+    """Dữ liệu Daily Check-in chuẩn STA và backward-compatible."""
 
     model_config = ConfigDict(
         from_attributes=True,
         json_schema_extra={
             "example": {
-                "id": "survey_abc123",
-                "assessment_id": "asm_xyz789",
-                "user_id": "user_123",
-                "survey": {
-                    "sleep_hours": 5.5,
-                    "working_hours": 10.0,
-                    "overtime_hours": 3,
-                    "has_deadline": "high",
-                    "work_days_per_week": 6,
-                    "stress_level": 8,
-                    "motivation_level": 3
-                },
-                "status": "completed",
-                "completed_at": "2026-08-24T10:15:00Z",
-                "created_at": "2026-08-24T10:14:00Z"
+                "exhaustion": {"e1": 4.0, "e2": 4.0, "e3": 3.0},
+                "disengagement": {"d1": 2.0, "d2": 3.0, "d3": 2.0},
+                "job_demands": {"jd1": 4.0, "jd2": 5.0, "jd3": 4.0},
+                "sleep_hours": 6.0,
+                "recovery_score": 2,
+                "quick_overload": 4,
+                "overload_reasons": ["Quá nhiều việc", "Áp lực deadline"],
+                "has_overtime_today": True,
+                "overtime_hours_today": 2.0,
+                "current_deadline_pressure": "high"
             }
         }
     )
 
-    id: str = Field(..., description="Document id (auto)")
+    # 1. Structured groups (STA Model)
+    exhaustion: Optional[ExhaustionGroup] = Field(
+        default_factory=ExhaustionGroup,
+        description="Nhóm câu hỏi Kiệt sức (OLBI: E1-E3)"
+    )
+    disengagement: Optional[DisengagementGroup] = Field(
+        default_factory=DisengagementGroup,
+        description="Nhóm câu hỏi Xa cách công việc (OLBI: D1-D3)"
+    )
+    job_demands: Optional[JobDemandsGroup] = Field(
+        default_factory=JobDemandsGroup,
+        description="Nhóm câu hỏi Yêu cầu công việc (JD-R: JD1-JD3)"
+    )
+    recovery: Optional[RecoveryGroup] = Field(
+        default_factory=RecoveryGroup,
+        description="Nhóm hồi phục (Giấc ngủ + Cảm nhận hồi phục)"
+    )
+    quick_overload_data: Optional[QuickOverloadGroup] = Field(
+        default_factory=QuickOverloadGroup,
+        description="Đánh giá quá tải nhanh"
+    )
+    work_changes: Optional[DailyWorkChangesGroup] = Field(
+        default_factory=DailyWorkChangesGroup,
+        description="Biến động làm việc trong ngày"
+    )
+
+    # 2. Flattened & Legacy fields (for backward compatibility & direct access)
+    sleep_hours: Optional[float] = Field(
+        default=None, ge=0.0, le=24.0,
+        description="Số giờ ngủ đêm qua"
+    )
+    recovery_score: Optional[int] = Field(
+        default=None, ge=1, le=5,
+        description="Cảm nhận hồi phục (1-5)"
+    )
+    quick_overload: Optional[int] = Field(
+        default=None, ge=1, le=5,
+        description="Mức độ quá tải hôm nay (1-5)"
+    )
+    overload_reasons: List[str] = Field(
+        default_factory=list,
+        description="Lý do quá tải"
+    )
+    has_overtime_today: Optional[bool] = Field(
+        default=None,
+        description="Có làm thêm hôm nay không"
+    )
+    overtime_hours_today: Optional[float] = Field(
+        default=None, ge=0.0, le=24.0,
+        description="Số giờ làm thêm hôm nay"
+    )
+    current_deadline_pressure: Optional[Literal["low", "medium", "high", "extreme"]] = Field(
+        default=None,
+        description="Áp lực deadline"
+    )
+
+    # Legacy attributes for compatibility with older code/tests
+    working_hours: Optional[float] = Field(default=None, ge=0.0, le=24.0)
+    overtime_hours: Optional[int] = Field(default=None, ge=0, le=24)
+    work_days_per_week: Optional[int] = Field(default=None, ge=1, le=7)
+    consecutive_work_days: Optional[int] = Field(default=None, ge=0, le=30)
+    rest_days: Optional[int] = Field(default=None, ge=0, le=7)
+    stress_level: Optional[int] = Field(default=None, ge=1, le=10)
+    motivation_level: Optional[int] = Field(default=None, ge=1, le=10)
+    work_satisfaction: Optional[int] = Field(default=None, ge=1, le=10)
+    has_deadline: Optional[Literal["low", "medium", "high", "extreme"]] = Field(default=None)
+    heart_rate: Optional[int] = Field(default=None, ge=30, le=220)
+
+    # Metadata
+    survey_version: str = Field(default="v3.0", description="Phiên bản survey schema")
+    submitted_at: Optional[datetime] = Field(default=None, description="Thời điểm submit")
+
+    def model_post_init(self, __context: Any) -> None:
+        """Sync flattened fields with structured groups if provided."""
+        # Sync sleep_hours
+        if self.sleep_hours is None and self.recovery and self.recovery.sleep_hours is not None:
+            self.sleep_hours = self.recovery.sleep_hours
+        elif self.sleep_hours is not None and self.recovery and self.recovery.sleep_hours is None:
+            self.recovery.sleep_hours = self.sleep_hours
+
+        # Sync recovery_score
+        if self.recovery_score is None and self.recovery and self.recovery.recovery_score is not None:
+            self.recovery_score = self.recovery.recovery_score
+        elif self.recovery_score is not None and self.recovery and self.recovery.recovery_score is None:
+            self.recovery.recovery_score = self.recovery_score
+
+        # Sync quick_overload
+        if self.quick_overload is None and self.quick_overload_data and self.quick_overload_data.quick_overload is not None:
+            self.quick_overload = self.quick_overload_data.quick_overload
+        elif self.quick_overload is not None and self.quick_overload_data and self.quick_overload_data.quick_overload is None:
+            self.quick_overload_data.quick_overload = self.quick_overload
+
+        # Sync overload reasons
+        if not self.overload_reasons and self.quick_overload_data and self.quick_overload_data.overload_reasons:
+            self.overload_reasons = self.quick_overload_data.overload_reasons
+        elif self.overload_reasons and self.quick_overload_data and not self.quick_overload_data.overload_reasons:
+            self.quick_overload_data.overload_reasons = self.overload_reasons
+
+        # Sync deadline
+        if self.current_deadline_pressure is None and self.has_deadline is not None:
+            self.current_deadline_pressure = self.has_deadline
+        elif self.has_deadline is None and self.current_deadline_pressure is not None:
+            self.has_deadline = self.current_deadline_pressure
+
+    def has_burnout_core(self) -> bool:
+        """Kiểm tra có đủ dữ liệu lõi (Exhaustion & Disengagement) hay không."""
+        has_e = self.exhaustion and self.exhaustion.mean_score() is not None
+        has_d = self.disengagement and self.disengagement.mean_score() is not None
+        return bool(has_e and has_d)
+
+    def has_recovery(self) -> bool:
+        """Kiểm tra có dữ liệu hồi phục (ngủ hoặc cảm nhận hồi phục) hay không."""
+        return self.sleep_hours is not None or (self.recovery and self.recovery.recovery_score is not None)
+
+    def has_any_data(self) -> bool:
+        """Check if any useful data is present."""
+        return self.has_burnout_core() or self.has_recovery() or self.quick_overload is not None or self.working_hours is not None
+
+
+class SurveyHistoryRecord(BaseModel):
+    """Lịch sử Daily Check-in theo assessment."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str = Field(..., description="Document id")
     assessment_id: str = Field(..., description="FK -> assessment")
-    user_id: str = Field(..., description="User id (denormalized)")
+    user_id: str = Field(..., description="User id")
+    survey: SurveyData = Field(..., description="Dữ liệu survey")
+    status: Literal["in_progress", "completed"] = Field(default="completed")
+    completed_at: Optional[datetime] = Field(default=None)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
 
-    # CHỈ raw answers - KHÔNG có analysis_result hay recommendations
-    survey: SurveyData = Field(..., description="Dữ liệu survey (raw answers)")
 
-    # Status
-    status: Literal["in_progress", "completed"] = Field(
-        default="in_progress",
-        description="Trạng thái survey"
+# ==========================================
+# Periodic Survey Models (Khảo sát định kỳ)
+# ==========================================
+
+class PeriodicJobResources(BaseModel):
+    """Job Resources dimension (JD-R) - Thang 1-5."""
+    jr1: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="JR1. Tôi nhận được sự hỗ trợ cần thiết để hoàn thành công việc."
+    )
+    jr2: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="JR2. Tôi có đủ quyền chủ động trong cách thực hiện công việc của mình."
+    )
+    jr3: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="JR3. Khi gặp khó khăn, tôi nhận được hướng dẫn hoặc phản hồi cần thiết."
+    )
+    jr4: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="JR4. Những nỗ lực của tôi trong công việc được ghi nhận."
     )
 
-    # Timestamps
-    completed_at: Optional[datetime] = Field(default=None, description="Thời điểm hoàn thành")
-    created_at: datetime = Field(default_factory=datetime.utcnow, description="Thời điểm tạo")
-    updated_at: datetime = Field(default_factory=datetime.utcnow, description="Thời điểm cập nhật")
+    def mean_score(self) -> Optional[float]:
+        vals = [v for v in [self.jr1, self.jr2, self.jr3, self.jr4] if v is not None]
+        return sum(vals) / len(vals) if vals else None
 
 
-# ==========================================
-# Survey Questions (Static Definition)
-# ==========================================
+class PeriodicSixAreas(BaseModel):
+    """Six Areas of Worklife - Thang 1-5."""
+    workload: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="Workload: Khối lượng công việc hiện tại phù hợp với khả năng của tôi."
+    )
+    control: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="Control: Tôi có đủ quyền chủ động trong những việc liên quan đến công việc của mình."
+    )
+    reward: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="Reward: Công sức và đóng góp của tôi được ghi nhận xứng đáng."
+    )
+    community: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="Community: Tôi nhận được sự hỗ trợ và tôn trọng cần thiết từ những người làm việc cùng mình."
+    )
+    fairness: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="Fairness: Tôi cảm thấy các quyết định liên quan đến công việc của mình được thực hiện công bằng."
+    )
+    values: Optional[float] = Field(
+        default=None, ge=1.0, le=5.0,
+        description="Values: Công việc hiện tại phù hợp với những điều tôi coi trọng."
+    )
 
-class SurveyQuestions(BaseModel):
-    """Câu hỏi survey chuẩn (static)."""
-
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "questions": [
-                    {
-                        "id": "sleep_hours",
-                        "text": "Trung bình bạn ngủ bao nhiêu giờ mỗi đêm?",
-                        "type": "number",
-                        "min": 0,
-                        "max": 24,
-                        "step": 0.5
-                    }
-                ]
-            }
+    def to_dict(self) -> Dict[str, Optional[float]]:
+        return {
+            "workload": self.workload,
+            "control": self.control,
+            "reward": self.reward,
+            "community": self.community,
+            "fairness": self.fairness,
+            "values": self.values,
         }
-    )
 
-    questions: list = Field(
-        default_factory=lambda: [
-            {
-                "id": "sleep_hours",
-                "text": "Trung bình bạn ngủ bao nhiêu giờ mỗi đêm?",
-                "type": "number",
-                "min": 0,
-                "max": 24,
-                "step": 0.5,
-                "required": True,
-                "hint": "Khuyến nghị: 7-9 giờ cho người trưởng thành",
-                "group": "sleep"
-            },
-            {
-                "id": "working_hours",
-                "text": "Trung bình bạn làm việc bao nhiêu giờ mỗi ngày?",
-                "type": "number",
-                "min": 0,
-                "max": 24,
-                "step": 0.5,
-                "required": True,
-                "hint": "Bao gồm giờ làm việc chính thức",
-                "group": "workload"
-            },
-            {
-                "id": "overtime_hours",
-                "text": "Bạn tăng ca bao nhiêu giờ/tuần?",
-                "type": "number",
-                "min": 0,
-                "max": 60,
-                "step": 1,
-                "required": False,
-                "hint": "Số giờ làm thêm ngoài giờ làm chính thức",
-                "group": "workload"
-            },
-            {
-                "id": "has_deadline",
-                "text": "Mức độ deadline hiện tại của bạn như thế nào?",
-                "type": "select",
-                "options": [
-                    {"value": "low", "label": "Thấp - Không có deadline gấp"},
-                    {"value": "medium", "label": "Vừa - Deadline có thể quản lý được"},
-                    {"value": "high", "label": "Cao - Deadline sát và nhiều"},
-                    {"value": "extreme", "label": "Rất cao - Deadline chồng chất, liên tục"}
-                ],
-                "required": True,
-                "group": "work_pressure"
-            },
-            {
-                "id": "work_days_per_week",
-                "text": "Bạn làm việc bao nhiêu ngày/tuần?",
-                "type": "number",
-                "min": 1,
-                "max": 7,
-                "step": 1,
-                "required": True,
-                "group": "workload"
-            },
-            {
-                "id": "stress_level",
-                "text": "Trên thang 1-10, mức độ stress hiện tại của bạn là bao nhiêu?",
-                "type": "scale",
-                "min": 1,
-                "max": 10,
-                "labels": {"1": "Rất thấp", "5": "Trung bình", "10": "Cực kỳ cao"},
-                "required": True,
-                "group": "psychological"
-            },
-            {
-                "id": "motivation_level",
-                "text": "Trên thang 1-10, mức độ động lực làm việc của bạn hiện tại là bao nhiêu?",
-                "type": "scale",
-                "min": 1,
-                "max": 10,
-                "labels": {"1": "Không có động lực", "5": "Bình thường", "10": "Rất hăng hái"},
-                "required": True,
-                "group": "psychological"
-            }
-        ],
-        description="Danh sách câu hỏi survey"
-    )
+
+class PeriodicSurveyRecord(BaseModel):
+    """Record khảo sát định kỳ môi trường làm việc của user."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str = Field(default="", description="Document id")
+    user_id: str = Field(..., description="User ID")
+    job_resources: PeriodicJobResources = Field(default_factory=PeriodicJobResources)
+    six_areas: PeriodicSixAreas = Field(default_factory=PeriodicSixAreas)
+    submitted_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 # ==========================================
-# DEPRECATED MODELS - Kept for migration reference only
+# Survey Questions Definitions (Static UI Definition)
 # ==========================================
 
-class SurveyAnalysisResult(BaseModel):
-    """DEPRECATED: Kết quả phân tích survey.
+class SurveyQuestions:
+    """Static definitions of Daily and Periodic survey questions."""
 
-    ĐÃ LOẠI BỎ KHỎI SURVEY MODEL.
-    Chuyển sang BurnoutResult cho:
-    - risk_level
-    - burnout_score (thay vì risk_score)
-    - summary
-    - factors
+    DAILY_QUESTIONS = [
+        # Exhaustion (OLBI)
+        {"id": "e1", "group": "exhaustion", "text": "Hôm nay tôi cảm thấy khó duy trì năng lượng để tiếp tục công việc.", "type": "scale_1_5"},
+        {"id": "e2", "group": "exhaustion", "text": "Hôm nay công việc khiến tôi cảm thấy mình đã tiêu hao rất nhiều năng lượng.", "type": "scale_1_5"},
+        {"id": "e3", "group": "exhaustion", "text": "Sau khi kết thúc công việc hôm nay, tôi vẫn khó lấy lại sức.", "type": "scale_1_5"},
+        # Disengagement (OLBI)
+        {"id": "d1", "group": "disengagement", "text": "Hôm nay tôi muốn tránh hoặc hạn chế những việc liên quan đến công việc.", "type": "scale_1_5"},
+        {"id": "d2", "group": "disengagement", "text": "Hôm nay tôi cảm thấy mình ít quan tâm đến công việc hơn bình thường.", "type": "scale_1_5"},
+        {"id": "d3", "group": "disengagement", "text": "Hôm nay tôi cảm thấy công việc của mình ít có ý nghĩa hơn bình thường.", "type": "scale_1_5"},
+        # Job Demands (JD-R)
+        {"id": "jd1", "group": "job_demands", "text": "Hôm nay tôi có quá nhiều việc phải hoàn thành.", "type": "scale_1_5"},
+        {"id": "jd2", "group": "job_demands", "text": "Hôm nay tôi phải hoàn thành công việc trong thời gian quá ngắn.", "type": "scale_1_5"},
+        {"id": "jd3", "group": "job_demands", "text": "Hôm nay tôi phải xử lý nhiều việc cùng lúc.", "type": "scale_1_5"},
+        # Recovery
+        {"id": "sleep_hours", "group": "recovery", "text": "Đêm qua bạn ngủ khoảng bao nhiêu giờ?", "type": "number", "min": 0, "max": 24, "step": 0.5},
+        {"id": "recovery_score", "group": "recovery", "text": "Sau khi ngủ hoặc nghỉ ngơi, hôm nay bạn cảm thấy mình đã hồi phục như thế nào?", "type": "scale_1_5", "labels": {"1": "Chưa hồi phục", "2": "Hồi phục rất ít", "3": "Hồi phục một phần", "4": "Khá hồi phục", "5": "Hồi phục tốt"}},
+        # Quick Overload
+        {"id": "quick_overload", "group": "quick_overload", "text": "Hôm nay công việc có khiến bạn cảm thấy quá tải không?", "type": "scale_1_5", "labels": {"1": "Hoàn toàn không", "2": "Ít", "3": "Khá nhiều", "4": "Rất nhiều", "5": "Cực kỳ nhiều"}, "conditional_reasons_on": [4, 5]},
+    ]
 
-    Chỉ giữ lại để migration reference.
-    """
-
-    model_config = ConfigDict(
-        deprecated=True,
-        json_schema_extra={
-            "example": {
-                "risk_level": "high",
-                "risk_score": 0,  # DEPRECATED - use burnout_score instead
-                "summary": "Nguy cơ burnout cao. Cần thay đổi lối sống.",
-                "suggestions": [
-                    "Ngủ ít hơn 6 tiếng ảnh hưởng nghiêm trọng đến sức khỏe",
-                    "Làm việc hơn 10 tiếng/ngày gây kiệt sức nghiêm trọng"
-                ]
-            }
-        }
-    )
-
-    risk_level: str = Field(default="low", description="[DEPRECATED] Mức độ nguy cơ")
-    risk_score: int = Field(default=0, description="[DEPRECATED] - Use burnout_score in BurnoutResult")
-    summary: str = Field(default="", description="[DEPRECATED] - Use summary in BurnoutResult.insight")
-    suggestions: list[str] = Field(default_factory=list, description="[DEPRECATED] - Use recommendations in BurnoutResult")
+    PERIODIC_QUESTIONS = [
+        # Job Resources
+        {"id": "jr1", "group": "job_resources", "text": "Tôi nhận được sự hỗ trợ cần thiết để hoàn thành công việc.", "type": "scale_1_5"},
+        {"id": "jr2", "group": "job_resources", "text": "Tôi có đủ quyền chủ động trong cách thực hiện công việc của mình.", "type": "scale_1_5"},
+        {"id": "jr3", "group": "job_resources", "text": "Khi gặp khó khăn, tôi nhận được hướng dẫn hoặc phản hồi cần thiết.", "type": "scale_1_5"},
+        {"id": "jr4", "group": "job_resources", "text": "Những nỗ lực của tôi trong công việc được ghi nhận.", "type": "scale_1_5"},
+        # Six Areas of Worklife
+        {"id": "workload", "group": "six_areas", "text": "Khối lượng công việc hiện tại phù hợp với khả năng của tôi.", "type": "scale_1_5"},
+        {"id": "control", "group": "six_areas", "text": "Tôi có đủ quyền chủ động trong những việc liên quan đến công việc của mình.", "type": "scale_1_5"},
+        {"id": "reward", "group": "six_areas", "text": "Công sức và đóng góp của tôi được ghi nhận xứng đáng.", "type": "scale_1_5"},
+        {"id": "community", "group": "six_areas", "text": "Tôi nhận được sự hỗ trợ và tôn trọng cần thiết từ những người làm việc cùng mình.", "type": "scale_1_5"},
+        {"id": "fairness", "group": "six_areas", "text": "Tôi cảm thấy các quyết định liên quan đến công việc của mình được thực hiện công bằng.", "type": "scale_1_5"},
+        {"id": "values", "group": "six_areas", "text": "Công việc hiện tại phù hợp với những điều tôi coi trọng.", "type": "scale_1_5"},
+    ]
 
 
-class SurveyRecommendation(BaseModel):
-    """DEPRECATED: Một recommendation cho survey.
-
-    ĐÃ LOẠI BỎ KHỎI SURVEY MODEL.
-    Recommendations nên được lưu trong BurnoutResult.recommendations
-    với Place Recommendation trong Recommendation Engine.
-    """
-
-    model_config = ConfigDict(
-        deprecated=True,
-        json_schema_extra={
-            "example": {
-                "place_id": "geoapify:abc123",
-                "name": "Công viên Tao Đàn",
-                "address": "Nguyễn Du, Q.1, TP.HCM",
-                "distance_meters": 500,
-                "category": "park",
-                "phone": "02838221234",
-                "website": "https://example.com"
-            }
-        }
-    )
-
-    place_id: Optional[str] = Field(default=None, description="[DEPRECATED] Place ID")
-    name: str = Field(default="", description="[DEPRECATED] Tên địa điểm/hoạt động")
-    address: Optional[str] = Field(default=None, description="[DEPRECATED] Địa chỉ")
-    distance_meters: Optional[int] = Field(default=None, description="[DEPRECATED] Khoảng cách (m)")
-    category: Optional[str] = Field(default=None, description="[DEPRECATED] Loại: park, cafe, gym...")
-    phone: Optional[str] = Field(default=None, description="[DEPRECATED] Số điện thoại")
-    website: Optional[str] = Field(default=None, description="[DEPRECATED] Website")
+# Legacy aliases for compatibility
+SurveyAnalysisResult = None
+SurveyRecommendation = None

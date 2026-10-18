@@ -85,6 +85,13 @@ class ChatHistoryRecord(BaseModel):
     # GPT Analysis (null cho assistant message hoặc nếu analyze fail)
     analysis: Optional[ChatAnalysis] = Field(default=None, description="Kết quả phân tích từ GPT")
 
+    # Client-side idempotency key (Q5). Nếu client retry cùng ID,
+    # backend sẽ trả response cũ thay vì xử lý lại.
+    client_message_id: Optional[str] = Field(
+        default=None,
+        description="Idempotency key từ client (UUID)",
+    )
+
     created_at: datetime = Field(default_factory=datetime.utcnow, description="Thời điểm gửi")
 
 

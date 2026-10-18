@@ -206,25 +206,27 @@ class AssessmentService:
           budget lon hon de hoan thanh JSON schema).
         - Check finish_reason: neu bi MAX_TOKENS -> raise de retry/ fallback.
         """
-        client = self._get_client()
-        if client is None:
-            raise RuntimeError("Google GenAI client not available")
-
-        settings = get_settings().google_ai
         prompt = system_prompt or SYSTEM_PROMPT
 
         def _sync_call():
-            resp = client.models.generate_content(
-                model=settings.model,
-                contents=user_prompt,
-                config={
-                    "system_instruction": prompt,
-                    "response_mime_type": "application/json",
-                    "temperature": 0.3,
-                    "max_output_tokens": 4096,
-                },
-            )
+            from app.core.gemini_rotator import get_gemini_rotator
+            rotator = get_gemini_rotator()
+
+            def _execute(client, model):
+                return client.models.generate_content(
+                    model=model,
+                    contents=user_prompt,
+                    config={
+                        "system_instruction": prompt,
+                        "response_mime_type": "application/json",
+                        "temperature": 0.3,
+                        "max_output_tokens": 4096,
+                    },
+                )
+
+            resp, model_used, key_used = rotator.execute_with_failover(_execute)
             text = resp.text or ""
+            self._last_model_used = model_used
             # Check finish_reason (STOP = OK, MAX_TOKENS/SAFETY = fail)
             finish = None
             try:
@@ -619,8 +621,17 @@ class AssessmentService:
             # Ensure disclaimer luon la constant (khong trust AI)
             data["disclaimer"] = DEFAULT_DISCLAIMER
             # Attach model + prompt version (audit trail)
-            data["ai_model"] = settings.model
+            data["ai_model"] = getattr(self, "_last_model_used", None)
             data["ai_prompt_version"] = AI_PROMPT_VERSION
+            # Normalize risk_level defensively
+            if "risk_level" in data:
+                rl = str(data["risk_level"]).lower().strip()
+                if rl in ("moderate", "trung_binh"):
+                    data["risk_level"] = "medium"
+                elif rl in ("critical", "nguy_cap", "bao_dong"):
+                    data["risk_level"] = "high"
+                elif rl not in ("low", "medium", "high", "can_theo_doi"):
+                    data["risk_level"] = "can_theo_doi"
 
             # Build result
             result = AIAssessmentResult.model_validate(data)
@@ -811,50 +822,32 @@ _assessment_service: Optional[AssessmentService] = None
 def get_assessment_service() -> AssessmentService:
     """Lay AssessmentService singleton.
 
-    Sprint 19: wire embedding_service + qdrant_service cho RAG.
-    Sprint 21: wire knowledge_service cho knowledge RAG.
-    Sprint 30: wire assessment_cache + chat_cache + rate_limiter.
+    Ghi chú: Qdrant DB / Vector RAG đã được lược bỏ theo yêu cầu.
+    Hệ thống sử dụng thuần túy Chat History & Firestore.
     """
     global _assessment_service
     if _assessment_service is None:
-        # Lazy import tranh cycle
         try:
-            from app.modules.assessment.services.embedding_service import (
-                get_embedding_service,
-            )
-            from app.modules.assessment.services.qdrant_service import (
-                get_qdrant_service,
-            )
-            from app.modules.assessment.services.rate_limiter import (
-                get_rate_limiter,
-            )
             from app.modules.assessment.repositories.assessment_cache_repository import (
                 get_assessment_cache_repository,
             )
             from app.modules.chat.repositories.chat_cache_repository import (
                 get_chat_cache_repository,
             )
-            from app.modules.knowledge.services import get_knowledge_service
-            embedding_svc = get_embedding_service()
-            qdrant_svc = get_qdrant_service()
+            from app.modules.assessment.services.rate_limiter import (
+                get_rate_limiter,
+            )
             assessment_cache = get_assessment_cache_repository()
             chat_cache = get_chat_cache_repository()
             rate_limiter = get_rate_limiter()
-            try:
-                knowledge_svc = get_knowledge_service()
-            except Exception:
-                knowledge_svc = None
         except Exception:
-            embedding_svc = None
-            qdrant_svc = None
             assessment_cache = None
             chat_cache = None
             rate_limiter = None
-            knowledge_svc = None
         _assessment_service = AssessmentService(
-            embedding_service=embedding_svc,
-            qdrant_service=qdrant_svc,
-            knowledge_service=knowledge_svc,
+            embedding_service=None,
+            qdrant_service=None,
+            knowledge_service=None,
             cache_repository=assessment_cache,
             chat_cache_repository=chat_cache,
             rate_limiter=rate_limiter,

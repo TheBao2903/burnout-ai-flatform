@@ -97,12 +97,27 @@ class ChatSessionRepository:
             "assessment_id": data.assessment_id,
             "user_id": data.user_id,
             "status": "active",
+            "current_stage": "greeting_and_probe",
+            "user_turn_count": 0,
+            "is_extended": False,
+            "is_crisis_active": False,
             "started_at": now,
             "last_activity_at": now,
             "closed_at": None,
             "summary": None,
             "message_count": 0,
             "closed_reason": None,
+            "used_topics": [],
+            "primary_cause": None,
+            "micro_action_offered": None,
+            # PR 2: Context analysis fields (init rỗng để tránh None khi serialize)
+            "detected_stressors": [],
+            "detected_emotions": [],
+            "behavioral_signals": [],
+            "context_facts": [],
+            "evidence_spans": [],
+            "support_need": None,
+            "last_analysis_confidence": 0.0,
             "created_at": now,
             "updated_at": now,
         }
@@ -125,35 +140,192 @@ class ChatSessionRepository:
         })
 
     def increment_message_count(self, session_id: str) -> None:
-        """Tăng message count."""
+        """Tăng message count tổng."""
         self.collection.document(session_id).update({
             "message_count": firestore.Increment(1)
         })
+
+    def _process_message_transaction(
+        self,
+        transaction,
+        session_id: str,
+        new_stage: str,
+        is_extended: Optional[bool],
+        is_crisis_active: Optional[bool],
+        increment_turn: bool,
+        was_fatigued_turn1: Optional[bool] = None,
+    ) -> int:
+        """Atomic transaction: đọc state, kiểm tra version, cập nhật stage + turn.
+
+        Q5/GAP-8: Gộp 2 writes (increment + update_stage) vào 1 transaction
+        để tránh race khi nhiều worker xử lý cùng session.
+
+        Returns:
+            user_turn_count SAU KHI increment (để route tính stage).
+
+        Raises:
+            ValueError: nếu session không tồn tại.
+        """
+        doc_ref = self.collection.document(session_id)
+        snapshot = doc_ref.get(transaction=transaction)
+        if not snapshot.exists:
+            raise ValueError(f"Session {session_id} disappeared mid-transaction")
+
+        data = snapshot.to_dict() or {}
+        current_turn = int(data.get("user_turn_count", 0))
+
+        if increment_turn:
+            new_turn = current_turn + 1
+        else:
+            new_turn = current_turn
+
+        updates = {
+            "current_stage": new_stage,
+            "user_turn_count": new_turn,
+            "last_activity_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }
+        if is_extended is not None:
+            updates["is_extended"] = is_extended
+        if is_crisis_active is not None:
+            updates["is_crisis_active"] = is_crisis_active
+        if was_fatigued_turn1 is not None:
+            updates["was_fatigued_turn1"] = was_fatigued_turn1
+        transaction.update(doc_ref, updates)
+        return new_turn
+
+    def process_message_atomically(
+        self,
+        session_id: str,
+        new_stage: str,
+        is_extended: Optional[bool] = None,
+        is_crisis_active: Optional[bool] = None,
+        increment_turn: bool = True,
+        was_fatigued_turn1: Optional[bool] = None,
+    ) -> int:
+        """Public API cho transaction trên. Trả về user_turn_count mới.
+
+        Raises:
+            ValueError: nếu session không tồn tại.
+        """
+        @firestore.transactional
+        def _txn_fn(transaction):
+            return self._process_message_transaction(
+                transaction, session_id, new_stage,
+                is_extended, is_crisis_active, increment_turn,
+                was_fatigued_turn1,
+            )
+
+        transaction = self.db.transaction()
+        return _txn_fn(transaction)
+
+    def get_user_turn_count(self, session_id: str) -> int:
+        """Đọc nhanh user_turn_count từ session."""
+        doc = self.collection.document(session_id).get()
+        if not doc.exists:
+            return 0
+        data = doc.to_dict() or {}
+        return int(data.get("user_turn_count", 0))
+
+    def get_session_flags(self, session_id: str) -> dict:
+        """Đọc các flag cần cho state machine: is_extended, is_crisis_active, was_fatigued_turn1, user_extended."""
+        doc = self.collection.document(session_id).get()
+        if not doc.exists:
+            return {
+                "is_extended": False,
+                "is_crisis_active": False,
+                "was_fatigued_turn1": False,
+                "user_extended": False,
+                "current_stage": None,
+                "is_closed": False,
+            }
+        data = doc.to_dict() or {}
+        return {
+            "is_extended": bool(data.get("is_extended", False)),
+            "is_crisis_active": bool(data.get("is_crisis_active", False)),
+            "was_fatigued_turn1": bool(data.get("was_fatigued_turn1", False)),
+            "user_extended": bool(data.get("user_extended", False)),
+            "current_stage": data.get("current_stage"),
+            "is_closed": data.get("status") == "closed",
+        }
+
+    def extend_session(self, session_id: str) -> bool:
+        """Kích hoạt gia hạn phiên trò chuyện (User-driven extension +3 lượt)."""
+        doc_ref = self.collection.document(session_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return False
+        doc_ref.update({
+            "status": "active",
+            "user_extended": True,
+            "closed_at": None,
+            "closed_reason": None,
+            "updated_at": datetime.utcnow(),
+        })
+        logger.info("Extended chat session %s (user_extended=True)", session_id)
+        return True
+
+    def increment_user_turns(self, session_id: str) -> None:
+        """Tăng số lượt hợp lệ của user (STA 4+2 discipline)."""
+        self.collection.document(session_id).update({
+            "user_turn_count": firestore.Increment(1),
+            "message_count": firestore.Increment(1),
+            "last_activity_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        })
+
+    def update_stage(
+        self,
+        session_id: str,
+        stage: str,
+        is_extended: Optional[bool] = None,
+        is_crisis_active: Optional[bool] = None,
+    ) -> None:
+        """Cập nhật trạng thái hội thoại và các cờ điều phối."""
+        updates = {
+            "current_stage": stage,
+            "updated_at": datetime.utcnow(),
+        }
+        if is_extended is not None:
+            updates["is_extended"] = is_extended
+        if is_crisis_active is not None:
+            updates["is_crisis_active"] = is_crisis_active
+        self.collection.document(session_id).update(updates)
 
     def close_session(
         self,
         session_id: str,
         reason: str,
-        summary: Optional[str] = None
+        summary: Optional[str] = None,
+        primary_cause: Optional[str] = None,
+        micro_action_offered: Optional[str] = None,
     ) -> Optional[ChatSession]:
         """
         Đóng session.
 
         Args:
             session_id: Session ID
-            reason: idle_timeout | max_duration | manual
+            reason: idle_timeout | max_duration | manual | completed_wrap_up | max_turns_completed
             summary: Optional session summary
+            primary_cause: Nguyên nhân chính (STA Compact Context Tagging)
+            micro_action_offered: Micro-action 5 phút đã khuyến nghị (STA Compact)
         """
         now = datetime.utcnow()
         doc_ref = self.collection.document(session_id)
 
-        doc_ref.update({
+        updates = {
             "status": "closed",
             "closed_at": now,
             "closed_reason": reason,
             "summary": summary,
             "updated_at": now,
-        })
+        }
+        if primary_cause is not None:
+            updates["primary_cause"] = primary_cause
+        if micro_action_offered is not None:
+            updates["micro_action_offered"] = micro_action_offered
+
+        doc_ref.update(updates)
 
         logger.info("Closed chat session %s (reason=%s)", session_id, reason)
 
@@ -230,6 +402,8 @@ class ChatSessionRepository:
                     session_id=new_session.id,
                     assessment_id=new_session.assessment_id,
                     status=new_session.status,
+                    current_stage=new_session.current_stage,
+                    user_turn_count=new_session.user_turn_count,
                     is_new=True,
                     message=f"Session trước đã đóng ({invalid_reason}). Session mới đã được tạo."
                 )
@@ -240,6 +414,8 @@ class ChatSessionRepository:
                     session_id=active_session.id,
                     assessment_id=active_session.assessment_id,
                     status=active_session.status,
+                    current_stage=getattr(active_session, "current_stage", "greeting_and_probe"),
+                    user_turn_count=getattr(active_session, "user_turn_count", 0),
                     is_new=False,
                     message=None
                 )
@@ -253,6 +429,8 @@ class ChatSessionRepository:
                 session_id=new_session.id,
                 assessment_id=new_session.assessment_id,
                 status=new_session.status,
+                current_stage=new_session.current_stage,
+                user_turn_count=new_session.user_turn_count,
                 is_new=True,
                 message=None
             )
@@ -266,12 +444,103 @@ class ChatSessionRepository:
         data["id"] = doc.id
         return ChatSession(**data)
 
+    def add_used_topic(self, session_id: str, topic: str) -> None:
+        """Thêm 1 topic vào used_topics của session (idempotent).
+
+        Dùng bởi ProbingQuestionsService để tránh hỏi lặp topic giữa
+        các request trong cùng session. State nằm trên Firestore nên
+        chia sẻ đúng giữa nhiều gunicorn worker.
+        """
+        if not topic:
+            return
+        doc_ref = self.collection.document(session_id)
+        doc_ref.update({
+            "used_topics": firestore.ArrayUnion([topic]),
+            "updated_at": datetime.utcnow(),
+        })
+
+    def update_session_tagging(
+        self,
+        session_id: str,
+        primary_cause: Optional[str] = None,
+        micro_action_offered: Optional[str] = None,
+    ) -> None:
+        """Cập nhật Context Tagging (STA Compact) cho session.
+
+        Chỉ ghi đè khi giá trị mới khác None, tránh overwrite kết quả
+        đã ghi từ lượt trước (vd Turn 2.5 → Turn 3 phản ánh lại cùng topic).
+        """
+        updates = {"updated_at": datetime.utcnow()}
+        if primary_cause:
+            updates["primary_cause"] = primary_cause
+        if micro_action_offered:
+            updates["micro_action_offered"] = micro_action_offered
+        if len(updates) > 1:
+            self.collection.document(session_id).update(updates)
+
+    def update_context_analysis(
+        self,
+        session_id: str,
+        detected_stressors: Optional[list] = None,
+        detected_emotions: Optional[list] = None,
+        behavioral_signals: Optional[list] = None,
+        context_facts: Optional[list] = None,
+        evidence_spans: Optional[list] = None,
+        support_need: Optional[str] = None,
+        confidence: Optional[float] = None,
+    ) -> None:
+        """PR 2: Cập nhật context analysis lên session document.
+
+        - Dùng ArrayUnion cho list fields (không ghi đè, chỉ thêm).
+        - Dùng set cho scalar fields (chỉ update khi khác None).
+        - Best-effort: lỗi Firestore KHÔNG block chat flow.
+        """
+        try:
+            doc_ref = self.collection.document(session_id)
+            updates: dict = {"updated_at": datetime.utcnow()}
+
+            if detected_stressors:
+                updates["detected_stressors"] = firestore.ArrayUnion(detected_stressors)
+            if detected_emotions:
+                updates["detected_emotions"] = firestore.ArrayUnion(detected_emotions)
+            if behavioral_signals:
+                updates["behavioral_signals"] = firestore.ArrayUnion(behavioral_signals)
+            if context_facts:
+                updates["context_facts"] = firestore.ArrayUnion(context_facts)
+            if evidence_spans:
+                updates["evidence_spans"] = firestore.ArrayUnion(evidence_spans)
+            if support_need is not None:
+                updates["support_need"] = support_need
+            if confidence is not None:
+                updates["last_analysis_confidence"] = confidence
+
+            if len(updates) > 1:
+                doc_ref.update(updates)
+        except Exception as exc:
+            logger.debug("update_context_analysis skipped for session %s: %s", session_id, exc)
+
     def get_sessions_by_user(self, user_id: str, limit: int = 10) -> list[ChatSession]:
         """Lấy sessions của user."""
         query = (
             self.collection
             .where("user_id", "==", user_id)
             .order_by("started_at", direction=firestore.Query.DESCENDING)
+            .limit(limit)
+        )
+
+        sessions = []
+        for doc in query.stream():
+            data = doc.to_dict() or {}
+            data["id"] = doc.id
+            sessions.append(ChatSession(**data))
+        return sessions
+
+    def get_sessions_by_assessment(self, assessment_id: str, limit: int = 10) -> list[ChatSession]:
+        """Lấy sessions gần nhất theo assessment_id (moi trang thai)."""
+        query = (
+            self.collection
+            .where("assessment_id", "==", assessment_id)
+            .order_by("last_activity_at", direction=firestore.Query.DESCENDING)
             .limit(limit)
         )
 

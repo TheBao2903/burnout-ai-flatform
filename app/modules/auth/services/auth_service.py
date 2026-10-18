@@ -13,7 +13,10 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-import bcrypt
+try:
+    import bcrypt
+except ImportError:
+    bcrypt = None  # Fallback if running outside venv or bcrypt not installed
 import jwt
 from pydantic import EmailStr
 
@@ -67,11 +70,15 @@ class AuthService:
     @staticmethod
     def hash_password(password: str) -> str:
         """Hash password bang bcrypt."""
+        if bcrypt is None:
+            raise RuntimeError("bcrypt module is not installed. Please activate venv or install bcrypt.")
         salt = bcrypt.gensalt(rounds=get_settings().auth.bcrypt_rounds)
         return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
 
     @staticmethod
     def verify_password(password: str, password_hash: str) -> bool:
+        if bcrypt is None:
+            return False
         try:
             return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
         except Exception:

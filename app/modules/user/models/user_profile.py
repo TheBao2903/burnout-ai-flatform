@@ -61,6 +61,28 @@ class UpdateProfileRequest(BaseModel):
         description="So dien thoai (10 so)"
     )
 
+    # Work baseline info (Thong tin cong viec nen - khong can nhap lai moi ngay)
+    standard_working_hours_per_day: Optional[float] = Field(
+        default=None, ge=1.0, le=24.0,
+        description="So gio lam viec tieu chuan/ngay (mac dinh 8.0)"
+    )
+    work_days_per_week: Optional[int] = Field(
+        default=None, ge=1, le=7,
+        description="So ngay lam viec/tuan (mac dinh 5)"
+    )
+    average_overtime_hours_per_week: Optional[float] = Field(
+        default=None, ge=0.0,
+        description="So gio tang ca trung binh/tuan"
+    )
+    job_title: Optional[str] = Field(
+        default=None, max_length=100,
+        description="Chuc danh / Vi tri cong viec"
+    )
+    industry_code: Optional[str] = Field(
+        default=None, max_length=50,
+        description="Ma nhom nganh nghe (tech, sales, finance, ...)"
+    )
+
 
 class UserProfileResponse(BaseModel):
     """Response model cho profile."""
@@ -76,6 +98,10 @@ class UserProfileResponse(BaseModel):
                 "birthday": "1995-03-15",
                 "phone": "0912345678",
                 "email_verified": True,
+                "standard_working_hours_per_day": 8.0,
+                "work_days_per_week": 5,
+                "average_overtime_hours_per_week": 2.5,
+                "job_title": "Software Engineer",
                 "created_at": "2024-01-15T10:30:00Z"
             }
         }
@@ -89,4 +115,9 @@ class UserProfileResponse(BaseModel):
     birthday: Optional[str] = None
     phone: Optional[str] = None
     email_verified: bool = False
+    standard_working_hours_per_day: Optional[float] = 8.0
+    work_days_per_week: Optional[int] = 5
+    average_overtime_hours_per_week: Optional[float] = 0.0
+    job_title: Optional[str] = None
+    industry_code: Optional[str] = None
     created_at: Optional[str] = None
