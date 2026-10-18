@@ -75,13 +75,16 @@ async def lifespan(app: FastAPI):
         if raw_json or (cred_path and cred_path.strip().startswith("{")):
             init_firebase()
         else:
-            abs_cred_path = pathlib.Path(cred_path)
-            if not abs_cred_path.is_absolute():
-                abs_cred_path = _ROOT / cred_path
-            if abs_cred_path.exists():
-                init_firebase(credential_path=str(abs_cred_path))
-            else:
-                init_firebase()
+            found_path = None
+            for p in [
+                pathlib.Path(cred_path) if pathlib.Path(cred_path).is_absolute() else _ROOT / cred_path,
+                pathlib.Path("/etc/secrets/serviceAccountKey.json"),
+                pathlib.Path("/etc/secrets/config/serviceAccountKey.json"),
+            ]:
+                if p.is_file():
+                    found_path = str(p)
+                    break
+            init_firebase(credential_path=found_path)
         logger.info("Firebase initialized")
     except Exception as exc:
         logger.warning("Firebase init failed: %s. App continues without Firestore.", exc)
@@ -195,7 +198,7 @@ app.add_middleware(
 # Health check
 # ==========================================
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     return {
         "status": "healthy",
@@ -206,7 +209,7 @@ async def health_check():
     }
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {
         "message": "Burnout AI Platform API",

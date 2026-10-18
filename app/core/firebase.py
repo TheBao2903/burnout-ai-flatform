@@ -94,12 +94,19 @@ class FirebaseConfig:
 
         # 2. Nếu không có raw JSON, kiểm tra file path
         if cred is None:
-            target_path = credential_path or env_cred
-            if target_path:
-                p = Path(target_path)
-                if p.is_file():
-                    cred = credentials.Certificate(str(p.resolve()))
-                    logger.info(f"Firebase initialized from certificate file: {p}")
+            possible_paths = [
+                credential_path,
+                env_cred,
+                "/etc/secrets/serviceAccountKey.json",
+                "/etc/secrets/config/serviceAccountKey.json",
+            ]
+            for tp in possible_paths:
+                if tp:
+                    p = Path(tp)
+                    if p.is_file():
+                        cred = credentials.Certificate(str(p.resolve()))
+                        logger.info(f"Firebase initialized from certificate file: {p}")
+                        break
 
         # 3. Khởi tạo App
         if cred is not None:
@@ -137,10 +144,16 @@ class FirebaseConfig:
                     if cred_path.strip().startswith("{"):
                         self.initialize(credential_path=cred_path)
                     else:
-                        p = Path(cred_path)
-                        if not p.is_absolute():
-                            p = root_path / p
-                        self.initialize(credential_path=str(p) if p.exists() else None)
+                        found_path = None
+                        for cand in [
+                            Path(cred_path) if Path(cred_path).is_absolute() else root_path / cred_path,
+                            Path("/etc/secrets/serviceAccountKey.json"),
+                            Path("/etc/secrets/config/serviceAccountKey.json"),
+                        ]:
+                            if cand.is_file():
+                                found_path = str(cand)
+                                break
+                        self.initialize(credential_path=found_path)
             except Exception as e:
                 raise RuntimeError(
                     f"Firebase chưa được khởi tạo và lazy init thất bại: {e}"
