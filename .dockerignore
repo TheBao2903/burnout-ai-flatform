@@ -1,0 +1,15 @@
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.git
+.gitignore
+.env
+tests
+docs
+uploads/*
+!uploads/.gitkeep
+eval_results*.json
+

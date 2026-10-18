@@ -104,6 +104,7 @@ def _preload_deepface():
     import os
     import warnings
     warnings.filterwarnings('ignore')
+    os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
     os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
