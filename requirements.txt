@@ -65,6 +65,8 @@ email-validator==2.2.0
 tensorflow==2.16.1
 tf-keras==2.16.0
 deepface==0.0.90
+lightphe==0.0.25
+lightdsa==0.0.3
 
 # -------------------------------------------
 # Computer Vision (for DeepFace)

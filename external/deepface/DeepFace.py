@@ -13,8 +13,14 @@ os.environ["TF_USE_LEGACY_KERAS"] = "1"
 from numpy.typing import NDArray
 import pandas as pd
 import tensorflow as tf
-from lightphe import LightPHE
-from lightdsa import LightDSA
+try:
+    from lightphe import LightPHE
+except ImportError:
+    LightPHE = None
+try:
+    from lightdsa import LightDSA
+except ImportError:
+    LightDSA = None
 
 # package dependencies
 from deepface.commons import package_utils, folder_utils

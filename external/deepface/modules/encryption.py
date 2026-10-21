@@ -2,8 +2,12 @@
 from typing import List, Union, Optional, cast
 
 # third-party dependencies
-from lightphe import LightPHE
-from lightphe.models.Tensor import EncryptedTensor
+try:
+    from lightphe import LightPHE
+    from lightphe.models.Tensor import EncryptedTensor
+except ImportError:
+    LightPHE = None
+    EncryptedTensor = None
 import numpy as np
 
 # project dependencies

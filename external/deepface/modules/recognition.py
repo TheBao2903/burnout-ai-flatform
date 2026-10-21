@@ -10,7 +10,10 @@ import numpy as np
 from numpy.typing import NDArray
 import pandas as pd
 from tqdm import tqdm
-from lightdsa import LightDSA
+try:
+    from lightdsa import LightDSA
+except ImportError:
+    LightDSA = None
 
 # project dependencies
 from deepface.commons import image_utils
@@ -105,7 +108,10 @@ def find(
             modified datastore that could execute arbitrary code.
 
             ```
-            from lightdsa import LightDSA
+            try:
+    from lightdsa import LightDSA
+except ImportError:
+    LightDSA = None
             cs = LightDSA(algorithm_name = "eddsa")
             DeepFace.find(..., credentials=cs)
             # DeepFace.find(..., credentials={**cs.dsa.keys, "algorithm_name": cs.algorithm_name})

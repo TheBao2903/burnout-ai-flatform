@@ -5,7 +5,10 @@ from collections import defaultdict
 # 3rd party dependencies
 import numpy as np
 from numpy.typing import NDArray
-from lightphe import LightPHE
+try:
+    from lightphe import LightPHE
+except ImportError:
+    LightPHE = None
 
 # project dependencies
 from deepface.commons import image_utils
