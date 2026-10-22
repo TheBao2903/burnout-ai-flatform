@@ -276,6 +276,25 @@ class SurveyAnalysisService:
             SurveyAnalysisResult với risk_score, risk_level, factors, summary
         """
         # Extract STA values if provided
+        if survey_data.get("survey_type") in ("daily_checkin", "olbi_periodic"):
+            from app.modules.survey.services.questionnaire_scoring import score_questionnaire
+            scores = score_questionnaire(survey_data)
+            factors = []
+            titles = {"exhaustion": "Cạn kiệt năng lượng", "disengagement": "Mất gắn kết", "job_demands": "Yêu cầu công việc"}
+            for key, mean in scores["means"].items():
+                level = scores["levels"][key]
+                if level != "low":
+                    factors.append(AnalysisFactor(
+                        code=key.upper(), score=round((mean - 1) / (scores["scale_max"] - 1) * 100, 1),
+                        severity=level, title=titles[key],
+                        description=f"Điểm trung bình {mean:.2f}/{scores['scale_max']}."))
+            summary = ("Kết quả hai chiều E/D phục vụ tự theo dõi. "
+                       "Mức thấp/trung bình/cao là quy ước hiển thị của ứng dụng, không phải ngưỡng chẩn đoán.")
+            recommendations = [{"code": "FOLLOW_UP", "title": "Theo dõi và điều chỉnh nhịp làm việc",
+                "description": "Xem riêng mức cạn kiệt và mất gắn kết; cân nhắc trao đổi về hỗ trợ và khối lượng công việc.",
+                "priority": "high" if scores["risk_level"] == "high" else "medium", "severity": scores["risk_level"]}]
+            return SurveyAnalysisResult(scores["risk_score"], scores["risk_level"], summary, factors, recommendations)
+
         exhaustion = survey_data.get("exhaustion") or {}
         disengagement = survey_data.get("disengagement") or {}
         job_demands = survey_data.get("job_demands") or {}
@@ -361,8 +380,8 @@ class SurveyAnalysisService:
             total_weighted_score += rec_score * 20
             total_weight += 20
 
-        if quick_overload_data.get("overload_rating") is not None:
-            ol_val = float(quick_overload_data["overload_rating"])
+        if quick_overload_data.get("rating", quick_overload_data.get("overload_rating")) is not None:
+            ol_val = float(quick_overload_data.get("rating", quick_overload_data.get("overload_rating")))
             if ol_val >= 4:
                 reasons = quick_overload_data.get("reasons", [])
                 reason_str = ", ".join(reasons) if reasons else "áp lực dồn nén"
@@ -611,6 +630,8 @@ class SurveyAnalysisService:
     @staticmethod
     def compute_rolling_stats(surveys: List[Dict], days: int = 7) -> Dict:
         """Compute rolling stats and trends."""
+        from app.modules.survey.services.questionnaire_history import daily_records
+        surveys = daily_records(surveys, days=days)
         stats = {
             'period_days': days,
             'total_surveys': len(surveys),
@@ -639,12 +660,13 @@ class SurveyAnalysisService:
             
             # Disengagement
             dis = s_data.get('disengagement', {})
-            if 'd1' in dis and dis['d1'] is not None:
-                dim_vals['disengagement'].append(float(dis['d1']))
+            d_vals = [float(dis[k]) for k in ['d1', 'd2', 'd3'] if dis.get(k) is not None]
+            if d_vals:
+                dim_vals['disengagement'].append(sum(d_vals) / len(d_vals))
                 
             # Job Demands
             jd = s_data.get('job_demands', {})
-            jd_vals = [float(jd[k]) for k in ['jd1', 'jd2'] if k in jd and jd[k] is not None]
+            jd_vals = [float(jd[k]) for k in ['jd1', 'jd2', 'jd3'] if k in jd and jd[k] is not None]
             if jd_vals:
                 dim_vals['job_demands'].append(sum(jd_vals) / len(jd_vals))
                 
@@ -686,12 +708,20 @@ class SurveyAnalysisService:
                 'values': [round(v, 2) for v in vals]
             }
             
+        core_trends = [stats['dimensions'][key]['trend'] for key in ('exhaustion', 'disengagement')]
+        stats['overall_trend'] = 'increasing' if 'increasing' in core_trends else 'decreasing' if 'decreasing' in core_trends else 'stable'
         return stats
 
     @staticmethod
     def check_allostatic_overload(surveys: List[Dict]) -> Optional[Dict]:
         """Check for continuous allostatic overload based on recent surveys."""
+        from app.modules.survey.services.questionnaire_history import daily_records, record_time, LOCAL_TIMEZONE
+        from datetime import timedelta
+        surveys = daily_records(surveys, days=7)
         if len(surveys) < 3:
+            return None
+        dates = [record_time(item).astimezone(LOCAL_TIMEZONE).date() for item in surveys[:3]]
+        if dates[0] - dates[1] != timedelta(days=1) or dates[1] - dates[2] != timedelta(days=1):
             return None
             
         recent_3 = surveys[:3]

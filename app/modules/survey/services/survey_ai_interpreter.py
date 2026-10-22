@@ -60,7 +60,8 @@ NGUYÊN TẮC QUAN TRỌNG:
 2. KHÔNG CHẨN ĐOÁN Y KHOA (Không phán "Bạn bị burnout", "Bạn bị trầm cảm").
 3. KHÔNG KHẲNG ĐỊNH NGUYÊN NHÂN NHÂN QUẢ CHẮC CHẮN (Dùng các từ "có thể liên quan đến", "dường như đang ảnh hưởng", "cho thấy nhu cầu nghỉ ngơi đang gia tăng").
 4. BÁM SÁT NGỮ CẢNH NGÀNH NGHỀ & HÌNH MẪU TÂM LÝ: Vận dụng đúng thuật ngữ và nỗi niềm đặc trưng của ngành nghề được cung cấp, nói đúng giọng điệu thấu cảm của hình mẫu năng lượng.
-5. VĂN PHONG TỰ NHIÊN, THẤU CẢM, DỄ TIẾP NHẬN: Giống như một người bạn tri kỷ hoặc cố vấn tâm lý tinh tế đang trò chuyện cùng người dùng.
+5. Chỉ dùng dữ liệu có trong bằng chứng. null/None nghĩa là chưa thu thập. Với OLBI định kỳ không suy đoán giấc ngủ, hồi phục hay áp lực. Mức phân loại là quy ước ứng dụng; không coi hình mẫu là chẩn đoán.
+6. VĂN PHONG TỰ NHIÊN, THẤU CẢM, DỄ TIẾP NHẬN: Giống như một người bạn tri kỷ hoặc cố vấn tâm lý tinh tế đang trò chuyện cùng người dùng.
 
 YÊU CẦU ĐẦU RA JSON BẮT BUỘC (Trả về duy nhất 1 JSON object):
 {
@@ -157,6 +158,9 @@ CHẨN ĐOÁN HÌNH MẪU NĂNG LƯỢNG (CROSS-METRIC ARCHETYPE):
 - Chỉ dẫn riêng cho AI: {ai_instruction}
 
 BẰNG CHỨNG KHẢO SÁT THỰC TẾ:
+- Loại khảo sát: {evidence.get('survey_type')}
+- Mức nền OLBI còn hiệu lực (nếu có; thang 1-4, không đồng nhất với daily 1-5): {evidence.get('baseline_olbi')}
+- Không diễn giải null/None thành điểm bình thường. Không suy đoán dữ liệu thiếu.
 - Trạng thái kiệt sức: {evidence.get('exhaustion_level', 'trung bình')}
 - Mức độ gắn kết: {evidence.get('disengagement_level', 'trung bình')}
 - Giấc ngủ: {evidence.get('sleep_hours', 7)} giờ (Đánh giá hồi phục sáng: {evidence.get('recovery_score', 3)}/5)
@@ -180,44 +184,25 @@ Hãy phân tích và xuất ra duy nhất 1 đối tượng JSON theo cấu trú
         industry_name = evidence.get("industry_name", "")
         reflection_starter = evidence.get("reflection_theme")
 
-        if ex_level in ("high", "critical"):
-            current = (
-                f"Áp lực từ vị trí {job_title} dạo gần đây dường như đang đòi hỏi nhiều sự tập trung và gắng sức, "
-                f"khiến năng lượng của bạn bị sụt giảm nhanh hơn bình thường. Cơ thể bạn đang phát đi những tín hiệu cần nghỉ ngơi và nạp lại năng lượng chủ động."
-            )
-        else:
-            current = (
-                f"Trạng thái năng lượng của bạn trong vị trí {job_title} hiện tại tương đối cân bằng, "
-                f"tuy nhiên vẫn có những thời điểm nhịp độ công việc khiến bạn cảm thấy hơi uể oải vào cuối ngày."
-            )
-
-        if "deadline" in str(reasons).lower() or "overtime" in str(reasons).lower():
-            factors = (
-                "Áp lực tiến độ dồn dập kết hợp với thời gian làm việc kéo dài dường như đang là yếu tố chính tác động trực tiếp đến khả năng phục hồi của bạn."
-            )
-        elif rec <= 2 or sleep < 6:
-            factors = (
-                "Chất lượng giấc ngủ và cảm giác nạp lại năng lượng chưa thật sự trọn vẹn vào đầu ngày có thể đang khiến bạn dễ bị mệt mỏi hơn bình thường."
-            )
-        else:
-            factors = (
-                f"Đặc thù khối lượng công việc trong mảng {industry_name or 'này'} cùng việc thiếu hụt các khoảng nghỉ ngắn dường như đang ảnh hưởng nhẹ đến sự tập trung của bạn."
-            )
-
-        change = (
-            "So với các lần đánh giá trước, nhu cầu nghỉ ngơi và giải tỏa áp lực của bạn đang có xu hướng đáng chú ý hơn."
-        )
-
-        ref_q = reflection_starter or f"Bạn có nhận thấy dạo này mình cần nhiều thời gian hơn để phục hồi sau một ngày làm {job_title} không?"
-        prompt_str = f"Tôi muốn tâm sự thêm về áp lực trong công việc {job_title} và cảm giác mệt mỏi dạo gần đây."
-
+        dis_level = evidence.get("disengagement_level", "medium")
+        current = {
+            "low": "Bạn ghi nhận mức cạn kiệt năng lượng thấp.",
+            "medium": "Bạn ghi nhận mức cạn kiệt năng lượng trung bình, nên tiếp tục theo dõi.",
+            "high": "Bạn ghi nhận mức cạn kiệt năng lượng cao, nên cân nhắc giảm tải và tìm hỗ trợ.",
+        }.get(ex_level, "Hãy tiếp tục theo dõi năng lượng của mình.")
+        current += {"low": " Mức mất gắn kết hiện thấp.", "medium": " Mức mất gắn kết hiện trung bình.", "high": " Mức mất gắn kết hiện cao."}.get(dis_level, "")
+        change = evidence.get("previous_comparison") or "Chưa có dữ liệu cùng loại để so sánh."
+        factors = "Khảo sát này chưa đủ bằng chứng để xác định nguyên nhân của trạng thái hiện tại."
+        if evidence.get("survey_type") != "olbi_periodic":
+            if (rec is not None and rec <= 2) or (sleep is not None and sleep < 6):
+                factors = "Thông tin bổ sung ghi nhận giấc ngủ hoặc cảm nhận hồi phục thấp; có thể cân nhắc điều chỉnh thời gian nghỉ."
         return AIInsightResult(
-            current_state_text=current,
-            change_text=change,
+            current_state_text=current, change_text=change,
             contributing_factors_text=factors,
-            reflection_question=ref_q,
-            suggested_chat_prompt=prompt_str,
+            reflection_question=reflection_starter or "Điều gì trong công việc hiện tại cần được điều chỉnh để bạn thấy dễ chịu hơn?",
+            suggested_chat_prompt="Tôi muốn trao đổi về năng lượng và mức gắn kết trong công việc.",
         )
+
 
 
 _interpreter_instance: Optional[SurveyAIInterpreter] = None

@@ -15,7 +15,7 @@ POST /api/survey/recommendations               - Tìm địa điểm gợi ý
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from app.core.deps import get_current_user
@@ -33,6 +33,10 @@ from app.modules.survey.services.survey_ai_interpreter import (
 )
 from app.modules.recommendation.services.place_recommendation_service import (
     get_place_recommendation_service,
+)
+
+from app.modules.survey.services.questionnaire_scoring import (
+    QuestionnaireRequest, score_questionnaire,
 )
 
 logger = logging.getLogger("burnout.survey.routes")
@@ -65,7 +69,7 @@ class SurveyRecommendationRequest(BaseModel):
     website: Optional[str] = None
 
 
-class SurveySubmitRequest(BaseModel):
+class SurveySubmitRequest(QuestionnaireRequest):
     """Request body cho POST /survey.
 
     CLEAN ARCHITECTURE:
@@ -115,6 +119,7 @@ class SurveyResponse(BaseModel):
     id: str
     assessment_id: str
     survey: dict
+    analysis_result: Optional[dict] = None
     status: str
     completed_at: Optional[str] = None
     created_at: str
@@ -132,7 +137,8 @@ class SurveyQuestionsResponse(BaseModel):
 # New: Analyze Request/Response Models
 # ==========================================
 
-class AnalyzeRequest(BaseModel):
+class AnalyzeRequest(QuestionnaireRequest):
+    assessment_id: Optional[str] = None
     """Request body cho POST /api/survey/analyze."""
 
     # Optional legacy fields with defaults
@@ -199,6 +205,7 @@ class AnalyzeResponse(BaseModel):
     recommendations: List[RecommendationResponse]
     analysis_version: str
     ai_insight: Optional[AIInsightResponse] = None
+    questionnaire_scores: Optional[dict] = None
 
 
 # ==========================================
@@ -360,6 +367,7 @@ async def get_survey(
         id=survey.get("id", ""),
         assessment_id=survey.get("assessment_id", ""),
         survey=survey.get("survey", {}),
+        analysis_result=survey.get("analysis_result"),
         status=survey.get("status", ""),
         completed_at=str(survey.get("completed_at")) if survey.get("completed_at") else None,
         created_at=str(survey.get("created_at")) if survey.get("created_at") else "",
@@ -378,7 +386,12 @@ async def submit_survey(
     Lưu survey data và chạy analysis ngay để có results khi xem lịch sử.
     """
     user_id = user["uid"]
+    existing = survey_repo.get_by_assessment(assessment_id)
+    if existing and existing.get("user_id") != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to update this survey")
     survey_data = request.model_dump(exclude_none=True)
+    if request.survey_type:
+        survey_data["questionnaire_scores"] = score_questionnaire(survey_data)
 
     # Legacy field sync if provided
     if "sleep_hours" in survey_data and "sleep_hour" not in survey_data:
@@ -420,7 +433,7 @@ async def submit_survey(
 
     logger.info(
         "Survey submitted with analysis for assessment %s by user %s, risk=%s",
-        assessment_id, user_id, result.risk_level,
+        assessment_id, user_id, (analysis_result or {}).get("risk_level"),
     )
 
     # Trigger BurnoutEngine analysis (async, non-blocking)
@@ -462,6 +475,11 @@ async def submit_survey(
         burnout_doc = {
             "assessment_id": assessment_id,
             "user_id": user_id,
+            "survey_type": request.survey_type,
+            "questionnaire_version": request.questionnaire_version,
+            "questionnaire_scores": survey_data.get("questionnaire_scores"),
+            "burnout_core": burnout_result.burnout_core.model_dump(),
+            "context": burnout_result.context.model_dump(),
             "burnout_score": burnout_result.burnout_score,
             "data_completeness": burnout_result.data_completeness,
             "risk_level": burnout_result.risk_level,
@@ -477,16 +495,11 @@ async def submit_survey(
                 for f in burnout_result.factors
             ],
             "recommendations": [
-                {
-                    "title": r.title,
-                    "description": r.description,
-                    "priority": r.priority,
-                    "type": r.type,
-                    "target_factor": r.target_factor,
-                }
+                r.model_dump() if hasattr(r, "model_dump") else r if isinstance(r, dict)
+                else {"title": str(r), "description": str(r), "priority": "medium", "type": "behavior"}
                 for r in burnout_result.recommendations
             ],
-            "insight": burnout_result.insight,
+            "insight": burnout_result.insight.model_dump() if hasattr(burnout_result.insight, "model_dump") else burnout_result.insight,
             "analyzed_at": burnout_result.analyzed_at,
         }
         burnout_repo.save(user_id=user_id, result=burnout_doc, assessment_id=assessment_id)
@@ -503,6 +516,7 @@ async def submit_survey(
         id=saved_survey.get("id", doc_id),
         assessment_id=assessment_id,
         survey=survey_data,
+        analysis_result=analysis_result,
         status="completed",
         completed_at=str(saved_survey.get("completed_at")) if saved_survey.get("completed_at") else None,
         created_at=str(saved_survey.get("created_at")) if saved_survey.get("created_at") else "",
@@ -560,10 +574,10 @@ async def get_survey_history(
 
 
 @survey_standalone_router.get('/rolling-stats', response_model=RollingStatsResponse)
-async def get_rolling_stats(days: int = 7, user: dict = Depends(get_current_user)):
+async def get_rolling_stats(days: int = Query(default=7, ge=1, le=90), user: dict = Depends(get_current_user)):
     """Lấy thống kê trung bình trượt (rolling average) và trend của user."""
     survey_repo = get_survey_history_repository()
-    surveys = survey_repo.get_recent_completed_surveys(user['uid'], limit=days * 2)
+    surveys = survey_repo.get_completed_questionnaires(user['uid'])
     stats = SurveyAnalysisService.compute_rolling_stats(surveys, days=days)
     stats['user_id'] = user['uid']
     return stats
@@ -573,12 +587,19 @@ async def get_rolling_stats(days: int = 7, user: dict = Depends(get_current_user
 async def get_alerts(user: dict = Depends(get_current_user)):
     """Lấy danh sách cảnh báo Allostatic Overload của user."""
     survey_repo = get_survey_history_repository()
-    surveys = survey_repo.get_recent_completed_surveys(user['uid'], limit=7)
+    surveys = survey_repo.get_completed_questionnaires(user['uid'])
     alerts = []
     overload = SurveyAnalysisService.check_allostatic_overload(surveys)
     if overload:
         alerts.append(overload)
     return {'alerts': alerts, 'has_critical': any(a.get('severity') == 'critical' for a in alerts)}
+
+
+@survey_standalone_router.get("/questionnaire-status")
+async def get_questionnaire_status(user: dict = Depends(get_current_user)):
+    from app.modules.survey.services.questionnaire_history import questionnaire_status
+    records = get_survey_history_repository().get_completed_questionnaires(user["uid"])
+    return questionnaire_status(records)
 
 
 @survey_standalone_router.get("/{survey_id}", response_model=dict)
@@ -619,6 +640,8 @@ async def analyze_survey(
 
     # Convert request to dict
     survey_data = {
+        "survey_type": request.survey_type,
+        "questionnaire_version": request.questionnaire_version,
         "sleep_hours": request.sleep_hours,
         "working_hours": request.working_hours,
         "overtime_hours": request.overtime_hours,
@@ -649,10 +672,14 @@ async def analyze_survey(
     result = analysis_service.analyze(survey_data)
 
     # Load past survey history for temporal trend comparison
-    prev_comparison = "Đây là lần đầu tiên người dùng làm khảo sát."
+    prev_comparison = "Chưa có lần khảo sát cùng loại để so sánh."
     trend_summary = "Chưa có đủ lịch sử khảo sát để so sánh xu hướng."
     try:
-        recent_surveys = survey_repo.get_recent_completed_surveys(user["uid"], limit=5)
+        recent_surveys = survey_repo.get_recent_completed_surveys(user["uid"], limit=1000)
+        recent_surveys = [item for item in recent_surveys
+                          if item.get("survey", {}).get("survey_type") == request.survey_type
+                          and (not request.assessment_id or item.get("assessment_id") != request.assessment_id)]
+        recent_surveys = recent_surveys[:5]
         if recent_surveys:
             prev_doc = recent_surveys[0]
             prev_s = prev_doc.get("survey") or {}
@@ -661,18 +688,26 @@ async def analyze_survey(
             prev_overload = (prev_s.get("quick_overload_data") or {}).get("rating") if isinstance(prev_s.get("quick_overload_data"), dict) else prev_s.get("quick_overload")
 
             comparison_parts = []
-            if prev_sleep is not None:
+            previous_scores = prev_s.get("questionnaire_scores")
+            if previous_scores and request.survey_type:
+                current_scores = score_questionnaire(survey_data)
+                for dimension in ("exhaustion", "disengagement"):
+                    before = previous_scores["means"].get(dimension)
+                    current = current_scores["means"][dimension]
+                    if before is not None:
+                        comparison_parts.append(f"{dimension}: lần trước {before:.2f}, lần này {current:.2f}")
+            if request.survey_type != "olbi_periodic" and prev_sleep is not None:
                 comparison_parts.append(f"Giấc ngủ lần trước: {prev_sleep}h (lần này: {request.sleep_hours}h)")
-            if prev_rec is not None:
+            if request.survey_type != "olbi_periodic" and prev_rec is not None:
                 comparison_parts.append(f"Điểm phục hồi lần trước: {prev_rec}/5 (lần này: {rec_data.get('recovery_score', 3)}/5)")
-            if prev_overload is not None:
+            if request.survey_type != "olbi_periodic" and prev_overload is not None:
                 comparison_parts.append(f"Mức quá tải lần trước: {prev_overload}/5 (lần này: {quick_data.get('rating', 2)}/5)")
 
             if comparison_parts:
                 prev_comparison = "So sánh với lần khảo sát trước: " + ", ".join(comparison_parts)
 
             count = len(recent_surveys) + 1
-            trend_summary = f"Người dùng đã thực hiện tổng cộng {count} lần khảo sát. Dữ liệu xu hướng ghi nhận sự thay đổi thực tế qua từng lần check-in."
+            trend_summary = f"Đang tham chiếu {count} lần khảo sát cùng loại gần nhất. Dữ liệu xu hướng ghi nhận sự thay đổi thực tế qua từng lần check-in."
     except Exception as e:
         logger.warning("Failed to fetch historical survey trend: %s", e)
 
@@ -692,6 +727,7 @@ async def analyze_survey(
 
     ind_ctx = resolve_industry_context(industry_code=industry_code, job_title=job_title)
 
+    protocol_scores = score_questionnaire(survey_data) if request.survey_type else None
     ex_score = 3.0
     if request.exhaustion:
         vals = [float(v) for v in request.exhaustion.values() if v is not None]
@@ -709,22 +745,40 @@ async def analyze_survey(
         mot = float(request.motivation_level or 5)
         dis_score = max(1.0, min(5.0, (11.0 - mot) / 2.0))
 
+    if protocol_scores:
+        ex_score = 1 + (protocol_scores["means"]["exhaustion"] - 1) * 4 / (protocol_scores["scale_max"] - 1)
+        dis_score = 1 + (protocol_scores["means"]["disengagement"] - 1) * 4 / (protocol_scores["scale_max"] - 1)
+
+    jd_values = list((request.job_demands or {}).values())
     daily_stats = {
-        "job_demands": 3.0,
+        "job_demands": sum(jd_values) / len(jd_values) if jd_values else None,
         "sleep_hours": request.sleep_hours,
-        "recovery_score": rec_data.get("recovery_score", 3),
-        "quick_overload": quick_data.get("rating", 2),
+        "recovery_score": rec_data.get("recovery_score"),
+        "quick_overload": quick_data.get("rating"),
         "overload_reasons": quick_data.get("reasons", []),
         "overtime_hours": request.overtime_hours or 0.0,
     }
-    archetype = resolve_burnout_archetype(ex_score, dis_score, daily_stats)
+    archetype = resolve_burnout_archetype(ex_score, dis_score, {**daily_stats, "quick_overload": daily_stats["quick_overload"] or 0})
+
+    baseline = None
+    if request.survey_type == "daily_checkin":
+        from app.modules.survey.services.questionnaire_history import latest_olbi, record_time
+        from datetime import datetime, timezone, timedelta
+        try:
+            baseline = latest_olbi(survey_repo.get_completed_questionnaires(user["uid"]))
+            if baseline and datetime.now(timezone.utc) - record_time(baseline) > timedelta(days=14):
+                baseline = None
+        except Exception as exc:
+            logger.warning("Could not load OLBI baseline: %s", exc)
 
     evidence = {
-        "exhaustion_level": result.risk_level,
-        "disengagement_level": result.risk_level,
+        "baseline_olbi": baseline.get("survey", {}).get("questionnaire_scores") if baseline else None,
+        "survey_type": request.survey_type,
+        "exhaustion_level": protocol_scores["levels"]["exhaustion"] if protocol_scores else result.risk_level,
+        "disengagement_level": protocol_scores["levels"]["disengagement"] if protocol_scores else result.risk_level,
         "sleep_hours": request.sleep_hours,
-        "recovery_score": rec_data.get("recovery_score", 3),
-        "quick_overload": quick_data.get("rating", 2),
+        "recovery_score": rec_data.get("recovery_score"),
+        "quick_overload": quick_data.get("rating"),
         "overload_reasons": quick_data.get("reasons", []),
         "other_reason": quick_data.get("other_reason", ""),
         "previous_comparison": prev_comparison,
@@ -740,6 +794,9 @@ async def analyze_survey(
         "empathy_direction": archetype.empathy_direction,
         "ai_prompt_instruction": archetype.ai_prompt_instruction,
     }
+    if request.survey_type == "olbi_periodic":
+        evidence["archetype_name"] = "Chưa xác định: chỉ có hai chiều OLBI"
+        evidence["ai_prompt_instruction"] = "Chỉ diễn giải E/D; không suy đoán giấc ngủ, hồi phục, áp lực hay nguyên nhân."
     ai_insight_result = get_survey_ai_interpreter().generate_insight(evidence)
 
     logger.info(
@@ -750,6 +807,7 @@ async def analyze_survey(
     )
 
     return AnalyzeResponse(
+        questionnaire_scores=score_questionnaire(survey_data) if request.survey_type else None,
         risk_score=result.risk_score,
         risk_level=result.risk_level,
         summary=result.summary,

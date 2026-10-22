@@ -572,6 +572,9 @@ async def send_chat_message(
 
         if survey_doc:
             s_data = survey_doc.get("survey") or {}
+            if s_data.get("survey_type") in ("daily_checkin", "olbi_periodic"):
+                from app.modules.survey.services.questionnaire_scoring import engine_survey
+                s_data = engine_survey(s_data)
             ai_insight = (survey_doc.get("analysis_result") or {}).get(
                 "ai_insight"
             ) or {}
@@ -622,11 +625,11 @@ async def send_chat_message(
             survey_context = {
                 "job_title": job_title or ind_ctx.typical_roles[0],
                 "industry_name": ind_ctx.name,
-                "archetype_name": f"{archetype.icon} {archetype.name}",
+                "archetype_name": "Hai chiều OLBI; chưa xác định hình mẫu" if s_data.get("survey_type") == "olbi_periodic" else f"{archetype.icon} {archetype.name}",
                 "reflection_question": ai_insight.get("reflection_question", ""),
                 "overload_reasons": reasons,
-                "sleep_hours": daily_stats["sleep_hours"],
-                "recovery_score": daily_stats["recovery_score"],
+                "sleep_hours": None if s_data.get("survey_type") == "olbi_periodic" else daily_stats["sleep_hours"],
+                "recovery_score": None if s_data.get("survey_type") == "olbi_periodic" else daily_stats["recovery_score"],
             }
     except Exception as exc:
         logger.debug("Failed to build survey context: %s", exc)
@@ -1175,6 +1178,9 @@ def _build_survey_context_sync(assessment_id: str, user_id: str) -> Optional[dic
             return None
 
         s_data = survey_doc.get("survey") or {}
+        if s_data.get("survey_type") in ("daily_checkin", "olbi_periodic"):
+            from app.modules.survey.services.questionnaire_scoring import engine_survey
+            s_data = engine_survey(s_data)
         ai_insight = (survey_doc.get("analysis_result") or {}).get("ai_insight") or {}
         quick_data = s_data.get("quick_overload_data") or {}
         rec_data = s_data.get("recovery") or {}
@@ -1205,11 +1211,11 @@ def _build_survey_context_sync(assessment_id: str, user_id: str) -> Optional[dic
         return {
             "job_title": job_title or ind_ctx.typical_roles[0],
             "industry_name": ind_ctx.name,
-            "archetype_name": f"{archetype.icon} {archetype.name}",
+            "archetype_name": "Hai chiều OLBI; chưa xác định hình mẫu" if s_data.get("survey_type") == "olbi_periodic" else f"{archetype.icon} {archetype.name}",
             "reflection_question": ai_insight.get("reflection_question", ""),
             "overload_reasons": reasons,
-            "sleep_hours": daily_stats["sleep_hours"],
-            "recovery_score": daily_stats["recovery_score"],
+            "sleep_hours": None if s_data.get("survey_type") == "olbi_periodic" else daily_stats["sleep_hours"],
+            "recovery_score": None if s_data.get("survey_type") == "olbi_periodic" else daily_stats["recovery_score"],
         }
     except Exception:
         return None

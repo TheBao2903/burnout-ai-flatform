@@ -104,6 +104,12 @@ class BurnoutEngine:
         # 2. Extract or map survey inputs
         survey_dict = survey.model_dump() if hasattr(survey, "model_dump") else (survey if isinstance(survey, dict) else {})
 
+        protocol_scores = None
+        if survey_dict.get("survey_type") in ("daily_checkin", "olbi_periodic"):
+            from app.modules.survey.services.questionnaire_scoring import engine_survey
+            survey_dict = engine_survey(survey_dict)
+            protocol_scores = survey_dict["questionnaire_scores"]
+
         # Extract Core E1-E3, D1-D3
         e_group = survey_dict.get("exhaustion") or {}
         e_scores = []
@@ -187,6 +193,9 @@ class BurnoutEngine:
         e_level = get_dimension_level(e_mean)
         d_level = get_dimension_level(d_mean)
         jd_level = get_dimension_level(jd_mean)
+        if protocol_scores:
+            e_level = protocol_scores["levels"]["exhaustion"]
+            d_level = protocol_scores["levels"]["disengagement"]
 
         trend_dir = "stable"
         if trend:
@@ -292,6 +301,18 @@ class BurnoutEngine:
             else:
                 risk_level = "high"
 
+        if protocol_scores:
+            composite_score = protocol_scores["risk_score"]
+            risk_level = protocol_scores["risk_level"]
+            factors = []
+            for name in ("exhaustion", "disengagement"):
+                normalized = (protocol_scores["means"][name] - 1) / (protocol_scores["scale_max"] - 1) * 100
+                factors.append(BurnoutFactor(factor=name, score=normalized, weight=0.5,
+                    contribution=normalized / 2,
+                    details={"mean": protocol_scores["means"][name], "scale_max": protocol_scores["scale_max"]}))
+            e_level = protocol_scores["levels"]["exhaustion"]
+            d_level = protocol_scores["levels"]["disengagement"]
+
         # 12. Build Recommendations
         recommendations = self._generate_recommendations(
             composite_score=composite_score,
@@ -323,9 +344,11 @@ class BurnoutEngine:
             assessment_id=assessment_id,
             user_id=user_id,
             engine_version=ENGINE_VERSION,
+            survey_type=survey_dict.get("survey_type"),
+            questionnaire_scores=protocol_scores,
             burnout_core=BurnoutCoreResult(
-                exhaustion=DimensionDetail(score=e_mean, level=e_level, trend=trend_dir, indicator=e_indicator),
-                disengagement=DimensionDetail(score=d_mean, level=d_level, trend=trend_dir, indicator=d_indicator),
+                exhaustion=DimensionDetail(score=protocol_scores["means"]["exhaustion"] if protocol_scores else e_mean, level=e_level, trend=trend_dir, indicator=e_indicator),
+                disengagement=DimensionDetail(score=protocol_scores["means"]["disengagement"] if protocol_scores else d_mean, level=d_level, trend=trend_dir, indicator=d_indicator),
                 status=core_status,
             ),
             context=ContextResult(

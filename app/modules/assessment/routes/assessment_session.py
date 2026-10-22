@@ -349,6 +349,8 @@ async def run_burnout_analysis(
             "assessment_id": assessment_id,
             "user_id": user_id,
             "engine_version": burnout_result.engine_version,
+            "survey_type": getattr(burnout_result, "survey_type", None),
+            "questionnaire_scores": getattr(burnout_result, "questionnaire_scores", None),
             "burnout_core": burnout_result.burnout_core.model_dump() if hasattr(burnout_result.burnout_core, "model_dump") else burnout_result.burnout_core,
             "context": burnout_result.context.model_dump() if hasattr(burnout_result.context, "model_dump") else burnout_result.context,
             "supporting_signals": burnout_result.supporting_signals.model_dump() if hasattr(burnout_result.supporting_signals, "model_dump") else burnout_result.supporting_signals,

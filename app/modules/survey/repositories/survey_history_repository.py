@@ -16,7 +16,7 @@ Features:
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from google.cloud import firestore
@@ -58,11 +58,15 @@ class SurveyHistoryRepository:
         Returns:
             Document id.
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         # Check if survey exists for this assessment
         existing = self.get_by_assessment(assessment_id)
         doc_id = existing.get("id") if existing else None
+        if existing and existing.get("user_id") != user_id:
+            raise ValueError("Survey ownership mismatch")
+        if existing and existing.get("survey") == survey and existing.get("status") == status:
+            return doc_id
 
         data = {
             "assessment_id": assessment_id,
@@ -86,7 +90,9 @@ class SurveyHistoryRepository:
         else:
             # Create new
             data["created_at"] = firestore.SERVER_TIMESTAMP
-            doc_ref = self.collection.document()
+            from hashlib import sha256
+            stable_id = sha256(f"{user_id}:{assessment_id}".encode()).hexdigest()
+            doc_ref = self.collection.document(stable_id)
             doc_ref.set(data)
             logger.info("Created survey %s for assessment %s", doc_ref.id, assessment_id)
             return doc_ref.id
@@ -142,7 +148,7 @@ class SurveyHistoryRepository:
         # Query đơn giản nhất có thể - chỉ filter user_id, không filter status
         # Vì query `.where(status, ...)` với completed_only=True cần composite index
         # nên ta lấy tất cả rồi filter bằng Python
-        query = self.collection.where("user_id", "==", user_id).limit(limit * 3)
+        query = self.collection.where("user_id", "==", user_id)
 
         results = []
         for doc in query.stream():
@@ -159,36 +165,30 @@ class SurveyHistoryRepository:
 
         # Sort bằng Python theo completed_at DESC
         def get_sort_key(item):
-            ts = item.get("completed_at")
-            if ts is None:
-                ts = item.get("created_at")
-            if isinstance(ts, datetime):
-                return ts
-            return datetime.min
+            from app.modules.survey.services.questionnaire_history import record_time
+            from datetime import timezone
+            return record_time(item) or datetime.min.replace(tzinfo=timezone.utc)
 
         results.sort(key=get_sort_key, reverse=True)
         return results[:limit]
 
     def get_recent_completed_surveys(self, user_id: str, limit: int = 14) -> List[Dict[str, Any]]:
-        """Lấy các survey completed gần đây nhất của user."""
-        query = self.collection.where("user_id", "==", user_id).limit(limit * 3)
-        results = []
-        for doc in query.stream():
-            data = doc.to_dict() or {}
-            data["id"] = doc.id
-            if data.get("status") == "completed":
-                results.append(data)
-                
-        def get_sort_key(item):
-            ts = item.get("completed_at")
-            if ts is None:
-                ts = item.get("created_at")
-            if isinstance(ts, datetime):
-                return ts
-            return datetime.min
+        # Filter first, sort next, limit last. An unordered Firestore limit can
+        # silently discard the newest records, including the OLBI baseline.
+        from app.modules.survey.services.questionnaire_history import record_time
+        from datetime import timezone
+        records = self.get_completed_questionnaires(user_id)
+        records.sort(key=lambda item: record_time(item) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        return records[:limit]
 
-        results.sort(key=get_sort_key, reverse=True)
-        return results[:limit]
+    def get_completed_questionnaires(self, user_id: str) -> List[Dict[str, Any]]:
+        results = []
+        for doc in self.collection.where("user_id", "==", user_id).stream():
+            data = doc.to_dict() or {}
+            if data.get("status") == "completed":
+                data["id"] = doc.id
+                results.append(data)
+        return results
 
     def list_by_user_in_range(
         self,
@@ -423,6 +423,12 @@ class SurveyHistoryRepository:
         doc_ref.set(data)
         logger.info("Saved periodic survey %s for user %s", doc_ref.id, user_id)
         return doc_ref.id
+
+    def list_periodic_surveys(self, user_id: str) -> List[Dict[str, Any]]:
+        records = []
+        for doc in self.periodic_collection.where("user_id", "==", user_id).stream():
+            records.append({**(doc.to_dict() or {}), "id": doc.id})
+        return records
 
     def get_latest_periodic_survey(self, user_id: str) -> Optional[Dict[str, Any]]:
         """Lấy kết quả khảo sát định kỳ mới nhất của user."""

@@ -338,6 +338,9 @@ class SurveyNormalizer:
             # Fallback: survey_record có thể là survey trực tiếp
             survey = survey_record
 
+        if isinstance(survey, dict) and survey.get("survey_type") in ("daily_checkin", "olbi_periodic"):
+            return survey
+
         if isinstance(survey, dict):
             return SurveyData(
                 sleep_hours=survey.get("sleep_hours") or survey.get("sleep_hour"),
@@ -421,7 +424,7 @@ class BurnoutInput:
             "assessment_id": self.assessment_id,
             "session_id": self.session_id or self.assessment_id,
             "user_id": self.user_id,
-            "survey": self.survey.to_dict() if self.survey else None,
+            "survey": self.survey if isinstance(self.survey, dict) else self.survey.to_dict() if self.survey else None,
             "emotion": self.emotion if isinstance(self.emotion, dict) else None,
             "chat": self.chat if isinstance(self.chat, dict) else None,
             "trend": self.trend if isinstance(self.trend, dict) else None,
@@ -478,7 +481,12 @@ class BurnoutInputBuilder:
         chat_agg = ChatAggregator.aggregate(self.chats)
 
         # 4. Analyze trend
-        trend = TrendAnalyzer.analyze(self.historical_results)
+        history = self.historical_results
+        if isinstance(survey_data, dict) and survey_data.get("survey_type"):
+            history = [item for item in history
+                       if item.get("survey_type") == survey_data["survey_type"]
+                       and item.get("assessment_id") != self.assessment_id]
+        trend = TrendAnalyzer.analyze(history)
 
         # 5. Calculate data completeness
         has_survey = survey_data is not None

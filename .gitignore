@@ -48,7 +48,9 @@ venv.bak/
 # Testing / Coverage
 # =========================================================
 
-tests/
+tests/*
+!tests/test_questionnaire_contract.py
+!tests/test_dashboard_insight.py
 .pytest_cache/
 .hypothesis/
 .tox/

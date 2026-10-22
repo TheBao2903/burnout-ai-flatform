@@ -42,7 +42,16 @@ class BurnoutRepository:
             assessment_id: Assessment ID (central identifier).
             emotion_id: Optional FK emotion doc.
         """
-        doc_ref = self.collection.document()
+        existing = self.get_by_assessment(assessment_id) if assessment_id else None
+        if existing and existing.get("user_id") != user_id:
+            raise ValueError("Burnout result ownership mismatch")
+        if existing:
+            doc_ref = self.collection.document(existing["id"])
+        elif assessment_id:
+            from hashlib import sha256
+            doc_ref = self.collection.document(sha256(f"{user_id}:{assessment_id}".encode()).hexdigest())
+        else:
+            doc_ref = self.collection.document()
         data = {
             "user_id": user_id,
             "assessment_id": assessment_id,  # Central identifier
@@ -55,9 +64,19 @@ class BurnoutRepository:
             "recommendations": result.get("recommendations", []),
             "insight": result.get("insight", {}),
             "analyzed_at": result.get("analyzed_at", datetime.utcnow()),
-            "created_at": firestore.SERVER_TIMESTAMP,
         }
-        doc_ref.set(data)
+        for field in ("survey_type", "questionnaire_version", "questionnaire_scores", "engine_version",
+                      "burnout_core", "context", "supporting_signals", "data_quality", "data_sufficiency",
+                      "interpretation", "confidence", "disclaimer"):
+            if field in result:
+                data[field] = result[field]
+        if hasattr(data["insight"], "model_dump"):
+            data["insight"] = data["insight"].model_dump()
+        if existing:
+            doc_ref.update(data)
+        else:
+            data["created_at"] = firestore.SERVER_TIMESTAMP
+            doc_ref.set(data)
         logger.info(
             "Saved burnout doc %s for assessment %s (score=%.1f, risk=%s)",
             doc_ref.id, assessment_id,

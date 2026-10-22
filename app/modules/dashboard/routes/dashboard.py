@@ -14,10 +14,10 @@ Lưu ý: Dashboard CHỈ đọc dữ liệu, KHÔNG tính toán lại.
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from google.cloud import firestore
 
@@ -45,6 +45,60 @@ logger = logging.getLogger("burnout.dashboard.routes")
 router = APIRouter(prefix="/api/v1/dashboard", tags=["Dashboard"])
 
 
+class OlbiHistoryPoint(BaseModel):
+    id: str
+    assessment_id: Optional[str] = None
+    sequence: int
+    completed_at: str
+    timestamp: int
+    exhaustion: float
+    disengagement: float
+    change_from_previous: Dict[str, Optional[float]]
+
+
+class OlbiComparison(BaseModel):
+    baseline: Optional[float] = None
+    latest: Optional[float] = None
+    change_from_baseline: Optional[float] = None
+    change_from_previous: Optional[float] = None
+
+
+class OlbiProgressResponse(BaseModel):
+    period_days: Optional[int] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    scale_max: int = 4
+    total_records: int
+    visible_records: int
+    excluded_records: int
+    points: list[OlbiHistoryPoint]
+    baseline_at: Optional[str] = None
+    latest_at: Optional[str] = None
+    next_due_at: Optional[str] = None
+    comparisons: Dict[str, OlbiComparison]
+    direction: str
+    summary: str
+
+
+@router.get("/olbi-history", response_model=OlbiProgressResponse)
+async def get_olbi_history(
+    days: Optional[int] = Query(default=None, ge=1, le=3650),
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    user: dict = Depends(get_current_user),
+):
+    """Authenticated user's version-compatible OLBI history in the shared dashboard window."""
+    from app.modules.dashboard.services.olbi_progress import build_olbi_progress
+    from app.modules.dashboard.services.date_window import date_window
+    try:
+        date_window(start_date, end_date, days)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    records = await asyncio.to_thread(
+        get_survey_history_repository().get_completed_questionnaires, user["uid"])
+    return build_olbi_progress(records, days=days, start_date=start_date, end_date=end_date)
+
+
 # ==========================================
 # Helper Functions
 # ==========================================
@@ -63,7 +117,7 @@ def _normalize_datetime(dt):
     if isinstance(dt, datetime):
         # Strip timezone info for consistent comparison
         if dt.tzinfo is not None:
-            dt = dt.replace(tzinfo=None)
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
         return dt
     return None
 
@@ -450,11 +504,20 @@ class UserAnalyticsResponse(BaseModel):
 @router.get("/analytics", response_model=UserAnalyticsResponse)
 async def get_user_dashboard_analytics(
     user: dict = Depends(get_current_user),
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
 ):
     """Lấy analytics tổng hợp cho user dashboard.
 
     Endpoint này cung cấp data cho Analysis tab trong ProfilePage.
     """
+    from app.modules.dashboard.services.date_window import date_window, in_window, calendar_day
+    try:
+        window = date_window(start_date, end_date, days=90)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    first_day = calendar_day(window[0])
+    trend_days = [(first_day + timedelta(days=i)).isoformat() for i in range(window[2])]
     user_id = user["uid"]
 
     burnout_repo = get_burnout_repo()
@@ -470,6 +533,11 @@ async def get_user_dashboard_analytics(
         asyncio.to_thread(emotion_repo.list_by_user, user_id, 500),
         asyncio.to_thread(assessment_repo.list_by_user, user_id, 100),
     )
+
+    if start_date is not None:
+        burnout_history = [item for item in burnout_history if in_window(item.get("analyzed_at"), window)]
+        emotions = [item for item in emotions if in_window(item.get("created_at"), window)]
+        assessments = [item for item in assessments if in_window(item.get("created_at"), window)]
 
     # === BURNOUT DATA ===
     total_burnout = len(burnout_history)
@@ -492,12 +560,11 @@ async def get_user_dashboard_analytics(
         if analyzed:
             analyzed_dt = _normalize_datetime(analyzed)
             if analyzed_dt:
-                date_key = analyzed_dt.strftime("%Y-%m-%d")
+                date_key = calendar_day(analyzed).isoformat()
                 burnout_daily[date_key] = burnout_daily.get(date_key, 0) + 1
 
     burnout_trend = []
-    for i in range(89, -1, -1):
-        day = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+    for day in trend_days:
         burnout_trend.append({"date": day, "count": burnout_daily.get(day, 0)})
 
     # === EMOTION DATA ===
@@ -570,6 +637,8 @@ async def get_user_dashboard_analytics(
             .limit(100)
         )
         login_docs = list(login_query.stream())
+        if start_date is not None:
+            login_docs = [doc for doc in login_docs if in_window(doc.to_dict().get("timestamp"), window)]
         login_count = len(login_docs)
         if login_docs:
             last_doc = login_docs[0].to_dict()
@@ -598,14 +667,13 @@ async def get_user_dashboard_analytics(
                     except:
                         continue
                 if isinstance(ts, datetime):
-                    date_key = ts.strftime("%Y-%m-%d")
+                    date_key = calendar_day(ts).isoformat()
                     login_daily[date_key] = login_daily.get(date_key, 0) + 1
     except Exception as e:
         logger.warning(f"Error building login trend: {e}")
 
     login_trend = []
-    for i in range(89, -1, -1):
-        day = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+    for day in trend_days:
         login_trend.append({"date": day, "count": login_daily.get(day, 0)})
 
     # Emotions trend
@@ -621,12 +689,11 @@ async def get_user_dashboard_analytics(
                 except:
                     continue
             if isinstance(created, datetime):
-                date_key = created.strftime("%Y-%m-%d")
+                date_key = calendar_day(created).isoformat()
                 emotions_daily[date_key] = emotions_daily.get(date_key, 0) + 1
 
     emotions_trend = []
-    for i in range(89, -1, -1):
-        day = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+    for day in trend_days:
         emotions_trend.append({"date": day, "count": emotions_daily.get(day, 0)})
 
     # Assessments trend
@@ -642,12 +709,11 @@ async def get_user_dashboard_analytics(
                 except:
                     continue
             if isinstance(created, datetime):
-                date_key = created.strftime("%Y-%m-%d")
+                date_key = calendar_day(created).isoformat()
                 assessments_daily[date_key] = assessments_daily.get(date_key, 0) + 1
 
     assessments_trend = []
-    for i in range(89, -1, -1):
-        day = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+    for day in trend_days:
         assessments_trend.append({"date": day, "count": assessments_daily.get(day, 0)})
 
     return UserAnalyticsResponse(
@@ -886,254 +952,55 @@ def _generate_warnings(
     return warnings
 
 
-async def _compute_sta_analytics(range_surveys: list, days: int, user_id: Optional[str] = None, profile: Optional[dict] = None) -> dict:
-    """Tổng hợp phân tích theo chuẩn khoa học STA (Core - Context - Trend - Synthesized Insight)."""
-    if not range_surveys:
-        return {
-            "sta_core": None,
-            "sta_context": None,
-            "sta_trend": [],
-            "synthesized_insight": None,
-        }
+async def _compute_sta_analytics(range_surveys: list, days: int, user_id: Optional[str] = None, profile: Optional[dict] = None, window_end: Optional[datetime] = None) -> dict:
+    from app.modules.dashboard.services.dashboard_evidence import build_dashboard_evidence, daily_dashboard_view
+    from app.modules.dashboard.services.date_window import calendar_day
+    end = calendar_day(window_end or datetime.now(timezone.utc))
+    evidence = build_dashboard_evidence(range_surveys, end - timedelta(days=days - 1), end, profile=profile)
+    return daily_dashboard_view(evidence)
 
-    ex_list = []
-    dis_list = []
-    jd_list = []
-    sleep_list = []
-    rec_list = []
-    ov_list = []
-    reason_counter: Dict[str, int] = {}
-    other_reasons = []
-    ot_hours_total = 0.0
-    ot_days_count = 0
-    sta_trend_items = []
 
-    for s in range_surveys:
-        raw = s.get("survey") or {}
-        c_at = _normalize_datetime(s.get("completed_at") or s.get("created_at"))
-        date_str = c_at.strftime("%Y-%m-%d") if c_at else "N/A"
-        iso_str = c_at.isoformat() if c_at else None
-
-        # 1. Exhaustion (E1-E3, Likert 1-5)
-        ex_dict = raw.get("exhaustion") or {}
-        if ex_dict and any(k in ex_dict for k in ("e1", "e2", "e3")):
-            e_vals = [float(v) for v in ex_dict.values() if v is not None]
-            ex = round(sum(e_vals) / len(e_vals), 2) if e_vals else 2.5
-        else:
-            st = float(raw.get("stress_level") or 5)
-            ex = round(max(1.0, min(5.0, st / 2.0)), 2)
-        ex_list.append(ex)
-
-        # 2. Disengagement (D1-D3, Likert 1-5)
-        dis_dict = raw.get("disengagement") or {}
-        if dis_dict and any(k in dis_dict for k in ("d1", "d2", "d3")):
-            d_vals = [float(v) for v in dis_dict.values() if v is not None]
-            dis = round(sum(d_vals) / len(d_vals), 2) if d_vals else 2.0
-        else:
-            mot = float(raw.get("motivation_level") or 5)
-            dis = round(max(1.0, min(5.0, (11.0 - mot) / 2.0)), 2)
-        dis_list.append(dis)
-
-        # 3. Job Demands (JD1-JD3, Likert 1-5)
-        jd_dict = raw.get("job_demands") or {}
-        if jd_dict and any(k in jd_dict for k in ("jd1", "jd2", "jd3")):
-            jd_vals = [float(v) for v in jd_dict.values() if v is not None]
-            jd = round(sum(jd_vals) / len(jd_vals), 2) if jd_vals else 2.5
-        else:
-            jd = 3.0
-        jd_list.append(jd)
-
-        # 4. Sleep & Recovery
-        sleep_h = float(raw.get("sleep_hours") or (raw.get("recovery") or {}).get("sleep_hours") or 7.0)
-        rec_s = int(raw.get("recovery_score") or (raw.get("recovery") or {}).get("recovery_score") or 3)
-        sleep_list.append(sleep_h)
-        rec_list.append(rec_s)
-
-        # 5. Overload & Reasons
-        ov = int(raw.get("quick_overload") or (raw.get("quick_overload_data") or {}).get("rating") or 2)
-        ov_list.append(ov)
-        reasons = raw.get("overload_reasons") or (raw.get("quick_overload_data") or {}).get("reasons") or []
-        for r in reasons:
-            clean_r = r.split("(")[0].strip() if "(" in r else r.strip()
-            if clean_r:
-                reason_counter[clean_r] = reason_counter.get(clean_r, 0) + 1
-
-        other_text = raw.get("other_overload_reason") or (raw.get("quick_overload_data") or {}).get("other_reason")
-        if other_text and isinstance(other_text, str) and other_text.strip() and other_text.strip() not in other_reasons:
-            other_reasons.append(other_text.strip())
-
-        # 6. Overtime
-        had_ot = bool(raw.get("has_overtime_today") or (raw.get("work_changes") or {}).get("had_overtime"))
-        ot_h = float(raw.get("overtime_hours_today") or (raw.get("work_changes") or {}).get("overtime_hours") or 0.0)
-        if had_ot or ot_h > 0:
-            ot_hours_total += ot_h
-            ot_days_count += 1
-
-        sta_trend_items.append({
-            "date": date_str,
-            "analyzed_at": iso_str,
-            "exhaustion": ex,
-            "disengagement": dis,
-            "job_demands": jd,
-            "recovery_score": rec_s,
-            "sleep_hours": sleep_h,
-            "quick_overload": ov,
-        })
-
-    # Aggregates
-    n = len(range_surveys)
-    avg_ex = round(sum(ex_list) / n, 2)
-    avg_dis = round(sum(dis_list) / n, 2)
-    avg_jd = round(sum(jd_list) / n, 2)
-    avg_sleep = round(sum(sleep_list) / n, 1)
-    avg_rec = round(sum(rec_list) / n, 1)
-    overload_count = sum(1 for o in ov_list if o >= 4)
-
-    def calc_trend(series):
-        if len(series) < 2:
-            return "stable"
-        mid = len(series) // 2
-        first_half = sum(series[:mid]) / max(1, mid)
-        second_half = sum(series[mid:]) / max(1, len(series) - mid)
-        diff = second_half - first_half
-        if diff >= 0.25:
-            return "increasing"
-        elif diff <= -0.25:
-            return "decreasing"
-        return "stable"
-
-    ex_trend = calc_trend(ex_list)
-    dis_trend = calc_trend(dis_list)
-
-    def get_score_level(score):
-        if score >= 3.8:
-            return "critical"
-        elif score >= 3.2:
-            return "high"
-        elif score >= 2.5:
-            return "medium"
-        return "low"
-
-    total_reasons_selected = sum(reason_counter.values())
-    top_reasons = []
-    for r, count in sorted(reason_counter.items(), key=lambda x: x[1], reverse=True):
-        pct = round((count / max(1, total_reasons_selected)) * 100, 1)
-        top_reasons.append({
-            "reason": r,
-            "count": count,
-            "percentage": pct,
-        })
-
-    sta_core = {
-        "exhaustion": {
-            "score": avg_ex,
-            "level": get_score_level(avg_ex),
-            "trend": ex_trend,
-            "label": "Cạn kiệt năng lượng (Exhaustion)",
-        },
-        "disengagement": {
-            "score": avg_dis,
-            "level": get_score_level(avg_dis),
-            "trend": dis_trend,
-            "label": "Mất gắn kết (Disengagement)",
-        },
-    }
-
-    rec_status = "poor" if avg_rec < 2.5 or avg_sleep < 6.0 else ("good" if avg_rec >= 3.5 and avg_sleep >= 7.0 else "moderate")
-
-    sta_context = {
-        "job_demands": {
-            "score": avg_jd,
-            "level": get_score_level(avg_jd),
-            "label": "Yêu cầu & Áp lực công việc",
-        },
-        "recovery": {
-            "avg_sleep_hours": avg_sleep,
-            "avg_recovery_score": avg_rec,
-            "status": rec_status,
-        },
-        "overload_stats": {
-            "overload_count": overload_count,
-            "total_checkins": n,
-            "top_reasons": top_reasons[:5],
-            "other_reasons": other_reasons[:5],
-        },
-        "work_changes": {
-            "total_overtime_hours": round(ot_hours_total, 1),
-            "overtime_days": ot_days_count,
-        },
-    }
-
-    # 7. Resolve Industry Context & Cross-Metric Burnout Archetype
-    job_title = None
-    industry_code = None
-    if profile:
-        job_title = profile.get("job_title")
-        industry_code = profile.get("industry_code")
-    elif user_id:
-        try:
-            from app.modules.user.services.user_profile_service import get_profile_service
-            p = get_profile_service().get_profile(user_id) or {}
-            job_title = p.get("job_title")
-            industry_code = p.get("industry_code")
-        except Exception:
-            pass
-
-    from app.modules.burnout.helpers.industry_archetypes import resolve_industry_context
-    from app.modules.burnout.helpers.matrix_resolver import resolve_burnout_archetype
-
-    ind_ctx = resolve_industry_context(industry_code=industry_code, job_title=job_title)
-    daily_stats = {
-        "job_demands": avg_jd,
-        "sleep_hours": avg_sleep,
-        "recovery_score": avg_rec,
-        "ot_hours_total": ot_hours_total,
-        "overload_count": overload_count,
-    }
-    archetype = resolve_burnout_archetype(avg_ex, avg_dis, daily_stats)
-
-    # 8. Generate Synthesized Insight narrative using Gemini AI Interpreter (Tầng 3)
-    evidence = {
-        "days": days,
-        "total_checkins": n,
-        "exhaustion_level": get_score_level(avg_ex),
-        "exhaustion_trend": ex_trend,
-        "disengagement_level": get_score_level(avg_dis),
-        "disengagement_trend": dis_trend,
-        "recovery_status": rec_status,
-        "overload_count": overload_count,
-        "top_reasons": [r["reason"] for r in top_reasons[:5]],
-        "other_reasons": other_reasons[:5],
-        "ot_hours_total": round(ot_hours_total, 1),
-        "ot_days_count": ot_days_count,
-        # Industry & Archetype context
-        "job_title": job_title or ind_ctx.typical_roles[0],
-        "industry_name": ind_ctx.name,
-        "industry_icon": ind_ctx.icon,
-        "vocabulary_hints": ind_ctx.vocabulary_hints,
-        "stressors_context": ind_ctx.stressors_context,
-        "archetype_name": f"{archetype.icon} {archetype.name}",
-        "empathy_direction": archetype.empathy_direction,
-        "ai_prompt_instruction": archetype.ai_prompt_instruction,
-    }
-
+@router.get("/context-insight", response_model=dict)
+async def get_context_insight(
+    user: dict = Depends(get_current_user),
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    days: int = Query(default=30, ge=1, le=365),
+):
+    from app.modules.dashboard.services.date_window import date_window, calendar_day
+    from app.modules.dashboard.services.dashboard_evidence import build_dashboard_evidence
+    from app.modules.dashboard.services.dashboard_ai_interpreter import get_dashboard_ai_interpreter
+    from app.modules.user.services.user_profile_service import get_profile_service
     try:
-        from app.modules.dashboard.services.dashboard_ai_interpreter import get_dashboard_ai_interpreter
-        interpreter = get_dashboard_ai_interpreter()
-        synthesized_insight = await asyncio.to_thread(interpreter.generate_synthesized_insight, evidence)
-    except Exception as e:
-        logger.warning("Failed to invoke Dashboard AI Interpreter: %s", e)
-        synthesized_insight = {
-            "summary": f"Trong {days} ngày vừa qua, nhịp làm việc và năng lượng của bạn duy trì ở mức cân bằng tốt.",
-            "key_observations": ["Các chỉ số bối cảnh công việc và năng lượng duy trì ở mức ổn định."],
-        }
-
-    return {
-        "sta_core": sta_core,
-        "sta_context": sta_context,
-        "sta_trend": sta_trend_items,
-        "synthesized_insight": synthesized_insight,
+        window = date_window(start_date, end_date, days)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    uid = user["uid"]
+    # Factories run inside workers too: unavailable optional sources remain distinguishable from empty sources.
+    calls = {
+        "surveys": lambda: get_survey_repo().get_completed_questionnaires(uid),
+        "profile": lambda: get_profile_service().get_profile(uid),
+        "work_environment": lambda: get_survey_repo().list_periodic_surveys(uid),
+        "facial": lambda: get_emotion_repo().list_by_user(uid, 500),
+        "chat": lambda: get_chat_repo().list_by_user(uid, 500),
     }
+    results = await asyncio.gather(*(asyncio.to_thread(call) for call in calls.values()), return_exceptions=True)
+    data, statuses = {}, {}
+    for source, result in zip(calls, results):
+        if isinstance(result, Exception):
+            statuses[source] = "unavailable"
+            data[source] = {} if source == "profile" else []
+            logger.warning("Dashboard insight source unavailable: %s", source)
+        else:
+            statuses[source] = "available"
+            data[source] = result or ({} if source == "profile" else [])
+    # Recent supporting sources are bounded; disclose potential truncation instead of claiming full coverage.
+    for source in ("facial", "chat"):
+        if len(data[source]) >= 500:
+            statuses[source] = "recent_500_records_only"
+    evidence = build_dashboard_evidence(data["surveys"], calendar_day(window[0]), calendar_day(window[1] - timedelta(microseconds=1)),
+        profile=data["profile"], resources=data["work_environment"], emotions=data["facial"], chats=data["chat"], source_status=statuses)
+    return await asyncio.to_thread(get_dashboard_ai_interpreter().generate_synthesized_insight, evidence, uid)
 
 
 @router.get("/burnout-analytics", response_model=BurnoutAnalyticsResponse)
@@ -1141,6 +1008,8 @@ async def get_burnout_analytics(
     days: int = Query(default=30, ge=1, le=365, description="Số ngày để phân tích"),
     user_id: Optional[str] = Query(default=None, description="User ID (dành cho admin xem chi tiết user)"),
     user: dict = Depends(get_current_user),
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
 ):
     """Lấy burnout analytics tổng hợp cho user.
 
@@ -1159,8 +1028,13 @@ async def get_burnout_analytics(
     if user_id and user.get("role") == "admin":
         target_user_id = user_id
     user_id = target_user_id
-    now = datetime.utcnow()
-    start_date = now - timedelta(days=days)
+    from app.modules.dashboard.services.date_window import date_window, in_window
+    try:
+        window = date_window(start_date, end_date, days)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    days = window[2]
+    window_end = window[1] - timedelta(microseconds=1)
 
     burnout_repo = get_burnout_repo()
     emotion_repo = get_emotion_repo()
@@ -1173,9 +1047,15 @@ async def get_burnout_analytics(
     # Load burnout history, survey history, and profile concurrently in parallel threads
     all_burnout_history, all_user_surveys, user_profile = await asyncio.gather(
         asyncio.to_thread(burnout_repo.list_by_user, user_id, 100),
-        asyncio.to_thread(survey_repo.list_by_user, user_id, 100),
+        asyncio.to_thread(survey_repo.get_completed_questionnaires, user_id),
         asyncio.to_thread(profile_service.get_profile, user_id),
     )
+
+    # This endpoint backs daily analysis. Periodic OLBI has its own timeline,
+    # including when there are no daily check-ins and fallback analysis runs.
+    all_burnout_history = [item for item in all_burnout_history if item.get("survey_type") != "olbi_periodic"]
+    all_user_surveys = [item for item in all_user_surveys
+                        if (item.get("survey") or {}).get("survey_type") != "olbi_periodic"]
 
     # Filter by date range for trend
     filtered_history = []
@@ -1183,7 +1063,7 @@ async def get_burnout_analytics(
         analyzed = b.get("analyzed_at")
         if analyzed:
             analyzed_dt = _normalize_datetime(analyzed)
-            if analyzed_dt and analyzed_dt >= start_date:
+            if in_window(analyzed, window):
                 filtered_history.append(b)
 
     # Sort by date ascending for trend
@@ -1231,11 +1111,17 @@ async def get_burnout_analytics(
             from app.modules.burnout.services.burnout_engine import get_burnout_engine
 
             # Load emotions & chats concurrently (surveys already loaded in parallel above)
-            surveys = all_user_surveys[:20]
+            surveys = [item for item in all_user_surveys
+                       if in_window(item.get("completed_at") or item.get("created_at"), window)]
+            surveys.sort(key=lambda item: _normalize_datetime(item.get("completed_at") or item.get("created_at")) or datetime.min, reverse=True)
+            surveys = surveys[:20]
             emotions, chats = await asyncio.gather(
                 asyncio.to_thread(emotion_repo.list_by_user, user_id, 100),
                 asyncio.to_thread(chat_repo.list_by_user, user_id, 50),
             )
+
+            emotions = [item for item in emotions if in_window(item.get("created_at"), window)]
+            chats = [item for item in chats if in_window(item.get("created_at"), window)]
 
             if surveys:
                 # Use latest survey for current analysis
@@ -1391,11 +1277,11 @@ async def get_burnout_analytics(
     range_surveys = []
     for s in all_user_surveys:
         c_at = _normalize_datetime(s.get("completed_at") or s.get("created_at"))
-        if c_at and c_at >= start_date:
+        if in_window(s.get("completed_at") or s.get("created_at"), window):
             range_surveys.append(s)
     range_surveys.sort(key=lambda x: _normalize_datetime(x.get("completed_at") or x.get("created_at")) or datetime.min)
 
-    sta_data = await _compute_sta_analytics(range_surveys, days, user_id=user_id, profile=user_profile)
+    sta_data = await _compute_sta_analytics(range_surveys, days, user_id=user_id, profile=user_profile, window_end=window_end)
 
     # Statistics
     stats = {
