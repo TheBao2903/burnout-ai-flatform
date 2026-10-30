@@ -9,6 +9,7 @@ Hỗ trợ:
 import logging
 import threading
 import time
+import re
 from typing import Callable, Optional, Tuple, Any, List
 
 from google import genai
@@ -27,6 +28,7 @@ class GeminiRotator:
         self._clients: dict[str, genai.Client] = {}
         # Cooldown: dict mapping (key, model) -> expired_timestamp
         self._cooldowns: dict[Tuple[str, str], float] = {}
+        self._invalid_keys: set[str] = set()
 
     def _get_keys(self) -> List[str]:
         settings = get_settings().google_ai
@@ -42,27 +44,27 @@ class GeminiRotator:
         return settings.model_pool
 
     def _get_client_for_key(self, api_key: str) -> genai.Client:
-        if api_key not in self._clients:
-            self._clients[api_key] = genai.Client(
-                api_key=api_key,
-                http_options=types.HttpOptions(
-                    timeout=get_settings().google_ai.timeout_seconds * 1000,
-                    # Let the pool handle retries instead of repeatedly waiting
-                    # for the same unavailable model inside the SDK.
-                    retry_options=types.HttpRetryOptions(attempts=1),
-                ),
-            )
-        return self._clients[api_key]
+        with self._lock:
+            if api_key not in self._clients:
+                self._clients[api_key] = genai.Client(
+                    api_key=api_key,
+                    http_options=types.HttpOptions(
+                        timeout=get_settings().google_ai.timeout_seconds * 1000,
+                        retry_options=types.HttpRetryOptions(attempts=1),
+                    ),
+                )
+            return self._clients[api_key]
 
     def _is_cooling_down(self, key: str, model: str) -> bool:
         pair = (key, model)
-        if pair not in self._cooldowns:
-            return False
-        if time.time() > self._cooldowns[pair]:
-            # Đã hết thời gian cooldown, giải phóng
-            del self._cooldowns[pair]
-            return False
-        return True
+        with self._lock:
+            expiry = self._cooldowns.get(pair)
+            if expiry is None:
+                return False
+            if time.time() > expiry:
+                del self._cooldowns[pair]
+                return False
+            return True
 
     def mark_exhausted(self, key: str, model: str, error_msg: str):
         """Đánh dấu một cặp (key, model) bị kiệt hạn mức và kích hoạt thời gian chờ."""
@@ -113,6 +115,8 @@ class GeminiRotator:
         # Duyệt theo thứ tự ưu tiên: Ưu tiên Model tốt nhất, thử hết các Keys của Model đó
         for model in models:
             for key in keys:
+                if key in self._invalid_keys:
+                    continue
                 if self._is_cooling_down(key, model):
                     continue
 
@@ -133,11 +137,30 @@ class GeminiRotator:
                         or "prepayment" in err_msg.lower()
                     )
                     status_code = getattr(exc, "code", None)
+                    if status_code is None:
+                        match = re.search(r"(?<!\d)([45]\d{2})(?!\d)", err_msg)
+                        status_code = int(match[1]) if match else None
+                    lower_error = err_msg.lower()
+                    is_key_error = (
+                        status_code == 401
+                        or any(token in lower_error for token in (
+                            "api_key_invalid", "api key not valid", "api key expired",
+                            "reported as leaked", "api key was revoked",
+                        ))
+                    )
+                    if is_key_error:
+                        with self._lock:
+                            self._invalid_keys.add(key)
+                        logger.warning("Gemini credential rejected; trying next configured credential")
+                        continue
+                    if status_code == 404:
+                        logger.warning("Gemini model %s not found; trying next model", model)
+                        break
                     is_transient = (
                         status_code in (500, 502, 503, 504)
                         or isinstance(exc, (TimeoutError, TimeoutException, TransportError))
                         or any(token in err_msg.lower() for token in (
-                            "500", "502", "503", "504", "unavailable",
+                            "unavailable",
                             "deadline_exceeded", "timed out", "timeout",
                         ))
                     )

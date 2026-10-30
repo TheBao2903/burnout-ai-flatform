@@ -117,41 +117,20 @@ def evaluate_crisis_safety(message: str) -> tuple[bool, Optional[str]]:
     if not message or not message.strip():
         return False, None
 
-    msg_lower = message.lower().strip()
-    msg_raw = strip_accents(msg_lower)
-
-    # 1. Kiểm tra phủ định trước (ví dụ: 'tôi không muốn chết đâu')
-    for neg in NEGATION_PATTERNS:
-        if neg in msg_lower or neg in msg_raw:
-            return False, None
-
-    # 2. Kiểm tra thành ngữ thông tục (ví dụ: 'hôm nay mệt chết đi được')
-    has_colloquial = False
-    for coll in COLLOQUIAL_EXCLUSIONS:
-        if coll in msg_lower or coll in msg_raw:
-            has_colloquial = True
-            break
-
-    # 3. Quét tín hiệu nguy cơ bằng từ khóa
-    has_crisis_signal = False
-    for sig in CRISIS_CORE_SIGNALS:
-        if sig in msg_lower or sig in msg_raw:
-            has_crisis_signal = True
-            break
-
-    # 4. Quét tín hiệu nguy cơ bằng Regex (Passive suicidal patterns)
+    # Mask only the excluded span, never the entire message. A denial or
+    # colloquial expression must not hide a separate positive risk signal.
+    # Accented "từ từ" (slowly) is distinct from "tự tử"; do not collapse it
+    # into the unaccented risk phrase during normalization.
+    normalized = strip_accents(re.sub(r"\btừ từ\b", " ", message.lower()))
+    exclusions = sorted({strip_accents(s) for s in NEGATION_PATTERNS + COLLOQUIAL_EXCLUSIONS}, key=len, reverse=True)
+    for phrase in exclusions:
+        normalized = re.sub(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", " ", normalized)
+    signals = {strip_accents(s) for s in CRISIS_CORE_SIGNALS}
+    has_crisis_signal = any(re.search(r"(?<!\w)" + re.escape(s) + r"(?!\w)", normalized) for s in signals)
     if not has_crisis_signal:
-        for pat in PASSIVE_SUICIDE_PATTERNS:
-            if pat.search(msg_lower) or pat.search(msg_raw):
-                has_crisis_signal = True
-                break
-
-    # Nếu chỉ có thành ngữ thông tục mà không có tín hiệu nguy hại nghiêm trọng rõ rệt -> Không phải crisis
-    if has_colloquial and not any(k in msg_lower or k in msg_raw for k in ["tự tử", "tu tu", "tự sát", "tu sat", "muốn chết", "muon chet"]):
-        return False, None
-
-    if has_crisis_signal and not has_colloquial:
-        logger.warning("CRISIS SAFETY INTERLOCK ACTIVATED for message: %s", message[:50])
+        has_crisis_signal = any(re.search(strip_accents(p.pattern), normalized, re.IGNORECASE) for p in PASSIVE_SUICIDE_PATTERNS)
+    if has_crisis_signal:
+        logger.warning("CRISIS SAFETY INTERLOCK ACTIVATED")
         return True, CRISIS_SAFETY_RESPONSE_TEMPLATE
 
     return False, None
@@ -178,6 +157,8 @@ class ChatResponse:
     follow_up_topic: Optional[str]
     is_fallback: bool = False
     finish_reason: Optional[str] = None
+    micro_action: Optional[str] = None
+    reflection: Optional[str] = None
 
 
 class ChatResponseGenerator:
@@ -281,6 +262,15 @@ class ChatResponseGenerator:
             session_id=session_id,
             assessment_id=assessment_id,
         )
+        # Reuse the very same selection for prompt, storage and fallback.
+        selected_action = probing_service.select_micro_action(
+            cached_probe, user_message, probing_service.extract_facts(user_message)
+        ) if cached_probe else micro_action
+        detected_topic = probing_service._detect_topic_from_text(user_message, set())
+        grounded = bool(cached_probe and detected_topic == cached_probe.topic)
+        selected_cause = cached_probe.target_dimension if grounded else primary_cause
+        if not grounded:
+            selected_action = micro_action
 
         try:
             response_text, finish_reason = self._generate_with_gemini(prompt)
@@ -297,8 +287,8 @@ class ChatResponseGenerator:
                 response_text = self._stage_aware_fallback(
                     stage=stage,
                     survey_context=survey_context,
-                    primary_cause=primary_cause,
-                    micro_action=micro_action,
+                    primary_cause=selected_cause,
+                    micro_action=selected_action,
                 )
                 finish_reason = finish_reason + "_STAGE_VIOLATION"
                 is_fallback = True
@@ -306,9 +296,11 @@ class ChatResponseGenerator:
             return ChatResponse(
                 content=response_text,
                 analysis_context=analysis_context,
-                follow_up_topic=cached_probe.topic if cached_probe else self._extract_follow_up_topic(response_text),
+                follow_up_topic=detected_topic if grounded else None,
                 is_fallback=is_fallback,
                 finish_reason=finish_reason,
+                micro_action=selected_action,
+                reflection=cached_probe.reflection_template if cached_probe else None,
             )
         except Exception as exc:
             logger.error("Failed to generate chat response: %s", exc)
@@ -316,15 +308,17 @@ class ChatResponseGenerator:
             fallback_text = self._stage_aware_fallback(
                 stage=stage,
                 survey_context=survey_context,
-                primary_cause=primary_cause,
-                micro_action=micro_action,
+                primary_cause=selected_cause,
+                micro_action=selected_action,
             )
             return ChatResponse(
                 content=fallback_text,
                 analysis_context=analysis_context,
-                follow_up_topic=None,
+                follow_up_topic=detected_topic if grounded else None,
                 is_fallback=True,
                 finish_reason="FALLBACK",
+                micro_action=selected_action,
+                reflection=cached_probe.reflection_template if cached_probe else None,
             )
 
     def _output_violates_stage(self, text: str, stage: str) -> bool:
@@ -593,72 +587,38 @@ YÊU CẦU PHẢN HỒI:
         ), suggested_probe  # PR 2: trả về probe để cache
 
     def _generate_with_gemini(self, prompt: str) -> tuple[str, str]:
-        """Generate response using Gemini with safety interlock, smart retry, key rotation, and multi-model fallback.
-
-        Returns:
-            tuple[str, str]: (response_text, finish_reason_str)
-        """
+        """Validate every attempt, including token recovery, inside failover."""
         from app.core.gemini_rotator import get_gemini_rotator
         from google.genai import types
 
-        rotator = get_gemini_rotator()
-
-        primary_config = types.GenerateContentConfig(
-            temperature=0.7,
-            max_output_tokens=1500,
+        primary = types.GenerateContentConfig(
+            temperature=0.7, max_output_tokens=1500,
             thinking_config=types.ThinkingConfig(thinking_budget=512),
         )
+        recovery = types.GenerateContentConfig(
+            temperature=0.7, max_output_tokens=1500,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        )
 
-        def _call_gemini(client, model):
-            return client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=primary_config,
-            )
+        def finish(response):
+            if not response or not response.candidates:
+                raise RuntimeError("Gemini returned no candidates")
+            value = response.candidates[0].finish_reason
+            return str(getattr(value, "value", value)).split(".")[-1]
 
-        response, model_used, key_used = rotator.execute_with_failover(_call_gemini)
+        def call(client, model):
+            response = client.models.generate_content(model=model, contents=prompt, config=primary)
+            if finish(response) == "MAX_TOKENS":
+                response = client.models.generate_content(model=model, contents=prompt, config=recovery)
+            reason = finish(response)
+            if reason != "STOP":
+                raise RuntimeError(f"Gemini response rejected: {reason}")
+            if not response.text or not response.text.strip():
+                raise RuntimeError("Empty response text from Gemini")
+            return response
 
-        if not response or not response.candidates:
-            raise RuntimeError("Gemini returned no candidates")
-
-        candidate = response.candidates[0]
-        finish_reason = getattr(candidate, "finish_reason", None)
-        finish_reason_str = str(finish_reason) if finish_reason else "UNKNOWN"
-
-        # Cấu hình 2A: Tự động retry thông minh 1 lần nếu chạm trần MAX_TOKENS
-        if "MAX_TOKENS" in finish_reason_str:
-            logger.warning(
-                "Gemini response hit MAX_TOKENS limit (%s). Triggering smart retry with zero-thinking to recover full text...",
-                finish_reason_str,
-            )
-            recovery_config = types.GenerateContentConfig(
-                temperature=0.7,
-                max_output_tokens=1500,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-            )
-            client = rotator._get_client_for_key(key_used)
-            retry_resp = client.models.generate_content(
-                model=model_used,
-                contents=prompt,
-                config=recovery_config,
-            )
-            if retry_resp and retry_resp.candidates:
-                candidate = retry_resp.candidates[0]
-                rec_finish = getattr(candidate, "finish_reason", None)
-                finish_reason_str = str(rec_finish) if rec_finish else "STOP"
-                logger.info("Smart retry succeeded. Recovered finish_reason: %s", finish_reason_str)
-                if hasattr(retry_resp, "text") and retry_resp.text:
-                    return retry_resp.text.strip(), finish_reason_str
-
-        # Kiểm tra nếu bị bộ lọc an toàn chặn
-        if "SAFETY" in finish_reason_str:
-            logger.warning("Gemini response blocked by safety filter: %s", finish_reason_str)
-            raise RuntimeError("Gemini response blocked by safety filter")
-
-        if hasattr(response, "text") and response.text:
-            return response.text.strip(), finish_reason_str
-
-        raise RuntimeError("Empty response text from Gemini")
+        response, _, _ = get_gemini_rotator().execute_with_failover(call)
+        return response.text.strip(), finish(response)
 
     def _extract_follow_up_topic(self, response: str) -> Optional[str]:
         """Extract topic for follow-up from response."""

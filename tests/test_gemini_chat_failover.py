@@ -61,6 +61,40 @@ def test_invalid_request_does_not_repeat_across_pool(rotator):
     assert call.call_count == 1
 
 
+def test_revoked_key_does_not_disable_good_key(rotator):
+    calls = []
+    def call(key, model):
+        calls.append((key, model))
+        if key == "test-key-1":
+            raise RuntimeError("403 PERMISSION_DENIED API key was reported as leaked")
+        return "reply"
+    assert rotator.execute_with_failover(call)[2] == "test-key-2"
+    assert calls == [("test-key-1", "primary"), ("test-key-2", "primary")]
+
+
+def test_missing_model_tries_backup(rotator):
+    def call(key, model):
+        if model == "primary":
+            raise RuntimeError("404 NOT_FOUND model")
+        return "reply"
+    assert rotator.execute_with_failover(call)[1] == "backup"
+
+
+@pytest.mark.parametrize("reason", ["MAX_TOKENS", "SAFETY", "RECITATION"])
+def test_recovery_cannot_bypass_response_validation(monkeypatch, reason):
+    from app.core import gemini_rotator
+    client = Mock()
+    client.models.generate_content.side_effect = [
+        SimpleNamespace(candidates=[SimpleNamespace(finish_reason="MAX_TOKENS")], text="partial"),
+        SimpleNamespace(candidates=[SimpleNamespace(finish_reason=reason)], text="incomplete"),
+    ]
+    pool = Mock()
+    pool.execute_with_failover.side_effect = lambda call: (call(client, "primary"), "primary", "key")
+    monkeypatch.setattr(gemini_rotator, "get_gemini_rotator", lambda: pool)
+    with pytest.raises(RuntimeError, match=reason):
+        ChatResponseGenerator()._generate_with_gemini("prompt")
+
+
 def test_client_uses_configured_timeout_and_disables_sdk_retry(monkeypatch):
     from app.core import gemini_rotator
 
@@ -76,6 +110,37 @@ def test_client_uses_configured_timeout_and_disables_sdk_retry(monkeypatch):
     options = factory.call_args.kwargs["http_options"]
     assert options.timeout == 7000
     assert options.retry_options.attempts == 1
+
+
+@pytest.mark.parametrize("finish_reason", ["STOP", "MAX_TOKENS"])
+def test_chat_generation_configs_work_with_installed_sdk(monkeypatch, finish_reason):
+    """Exercise real SDK schemas: the production 1.2.0 pin rejected these."""
+    from app.core import gemini_rotator
+
+    first = SimpleNamespace(
+        candidates=[SimpleNamespace(finish_reason=finish_reason)], text="First reply",
+    )
+    recovered = SimpleNamespace(
+        candidates=[SimpleNamespace(finish_reason="STOP")], text="Recovered reply",
+    )
+    client = Mock()
+    client.models.generate_content.side_effect = [first, recovered]
+    pool = Mock()
+    pool.execute_with_failover.side_effect = lambda call: (
+        call(client, "test-model"), "test-model", "test-key",
+    )
+    pool._get_client_for_key.return_value = client
+    monkeypatch.setattr(gemini_rotator, "get_gemini_rotator", lambda: pool)
+
+    text, reason = ChatResponseGenerator()._generate_with_gemini("test prompt")
+    calls = client.models.generate_content.call_args_list
+    assert calls[0].kwargs["config"].thinking_config.thinking_budget == 512
+    if finish_reason == "MAX_TOKENS":
+        assert calls[1].kwargs["config"].thinking_config.thinking_budget == 0
+        assert text == "Recovered reply"
+    else:
+        assert text == "First reply"
+    assert reason == "STOP"
 
 
 @pytest.mark.parametrize("output, expected_fallback", [

@@ -15,7 +15,7 @@ Session policy:
 from datetime import datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
 class ChatSessionStatus(str):
@@ -109,6 +109,11 @@ class ChatSession(BaseModel):
         default=None,
         description="Lý do đóng session"
     )
+
+    @field_validator("closed_reason", mode="before")
+    @classmethod
+    def normalize_legacy_close_reason(cls, value):
+        return "manual" if value == "manual_user_decision" else value
 
     # STA Compact: Context Tagging (lưu khi đóng session để dashboard phân tích)
     used_topics: list = Field(

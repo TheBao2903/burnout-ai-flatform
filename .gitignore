@@ -52,6 +52,8 @@ tests/*
 !tests/test_questionnaire_contract.py
 !tests/test_dashboard_insight.py
 !tests/test_gemini_chat_failover.py
+!tests/test_chat_reliability.py
+!tests/test_sta_chat_v2_2.py
 .pytest_cache/
 .hypothesis/
 .tox/

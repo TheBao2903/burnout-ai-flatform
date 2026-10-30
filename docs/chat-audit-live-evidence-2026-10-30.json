@@ -1,0 +1,60 @@
+{
+  "date": "2026-10-30",
+  "frontend": "https://burnout-ai-frontend.vercel.app/chat",
+  "backend": "https://burnout-ai-platform.onrender.com",
+  "normal_extension_flow": {
+    "assessment_id": "XUN7yhpY8nfydqwLOezS",
+    "initial_session_id": "lSpW4gBmaVUfw1WCTH4y",
+    "turns": [
+      {"turn": 1, "completed": false, "stage": "greeting_and_probe", "is_fallback": true},
+      {"turn": 2, "completed": false, "stage": "reflect_and_support", "is_fallback": true},
+      {"turn": 3, "completed": true, "stage": "wrapping_up", "is_fallback": true},
+      {"action": "extend", "success": true, "message": "Phiên trò chuyện đã được gia hạn thêm 3 lượt."},
+      {"turn": 4, "completed": false, "stage": "reflect_and_support", "is_fallback": true},
+      {"turn": 5, "completed": true, "stage": "wrapping_up", "is_fallback": true}
+    ],
+    "post_after_completion": {
+      "http_status": 200,
+      "turn": 1,
+      "completed": false,
+      "new_session_id": "2r3FtjwvrqMpwWpMvAmX"
+    }
+  },
+  "replay_after_close_flow": {
+    "assessment_id": "0z11oWmYYzSd59UIQP0G",
+    "original_session_id": "jktuF8crU1vy8PoU4pKq",
+    "sequential_replay_while_active": {"idempotent_replay": true, "user_turn_count": 1},
+    "state_after_turn_3_close": {
+      "status": "none", "can_reply": false, "can_extend": false, "user_turn_count": 0
+    },
+    "replay_after_close": {
+      "idempotent_replay": true, "session_id_in_response": "jktuF8crU1vy8PoU4pKq", "user_turn_count": 3
+    },
+    "extension_after_replay": {
+      "session_id": "Nq1ZOZBTyCXryGPXXmHy", "success": true
+    },
+    "next_turn_after_extension": {"user_turn_count": 1, "current_stage": "greeting_and_probe"},
+    "interpretation": "Replay returned the old session, but an empty active session had been created before the replay check; extension acted on the new session."
+  },
+  "browser_simulations": {
+    "network_failure": {
+      "post_reached_server": false,
+      "draft_remaining": "",
+      "draft_visible_in_messages": false,
+      "error_visible": true
+    },
+    "session_switch_during_response": {
+      "response_mocked": true,
+      "post_reached_server": false,
+      "new_session_selected": true,
+      "old_reply_leaked_into_new_view": true
+    },
+    "time_parsing": {
+      "browser_timezone": "Asia/Bangkok",
+      "input_without_timezone": "2026-10-30T05:52:25",
+      "display_without_timezone": "05:52:25",
+      "input_with_utc_marker": "2026-10-30T05:52:25Z",
+      "display_with_utc_marker": "12:52:25"
+    }
+  }
+}

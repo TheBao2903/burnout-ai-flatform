@@ -12,11 +12,15 @@ GET  /api/v1/assessments/{id}/chat/summary - Tom tat session chat
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from uuid import uuid4
+
+from google.cloud import firestore
+from app.modules.chat.repositories.chat_request_repository import ChatRequestRepository, ChatRequestConflict
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.core.deps import get_current_user
 from app.modules.chat.repositories.chat_history_repository import (
@@ -27,23 +31,13 @@ from app.modules.chat.repositories.chat_session_repository import (
     ChatSessionRepository,
     get_chat_session_repository,
 )
-from app.modules.assessment.services.ai_service import (
-    AssessmentService,
-    get_assessment_service,
-)
 from app.modules.assessment.repositories.assessment_session_repository import (
     AssessmentSessionRepository,
     get_assessment_session_repository,
 )
 from app.modules.chat.services.chat_response_generator import (
-    ChatResponseGenerator,
-    ChatAnalysisContext,
     get_chat_response_generator,
     evaluate_crisis_safety,
-)
-from app.modules.chat.services.conversation_stages import (
-    ConversationStagesService,
-    get_conversation_stages_service,
 )
 from app.modules.chat.services.probing_questions import (
     get_probing_questions_service,
@@ -92,6 +86,16 @@ class ChatMessageResponse(BaseModel):
     role: str
     content: str
     created_at: str
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def normalize_timestamp(cls, value):
+        if not value:
+            return value
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else value
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.isoformat()
     session_id: Optional[str] = Field(default=None, description="Session ID")
     session_message: Optional[str] = Field(
         default=None,
@@ -101,6 +105,8 @@ class ChatMessageResponse(BaseModel):
         default=None,
         description="Hành động gợi ý giao diện (VD: decision_buttons tại Gatekeeper Lượt 4)"
     )
+    is_fallback: bool = False
+    finish_reason: Optional[str] = None
     can_reply: bool = Field(
         default=True,
         description="True nếu người dùng vẫn có thể tiếp tục trò chuyện; False nếu phiên đã đóng"
@@ -154,11 +160,6 @@ def get_chat_session_repo() -> ChatSessionRepository:
     return get_chat_session_repository()
 
 
-def get_assessment_svc() -> AssessmentService:
-    from app.modules.assessment.services.ai_service import get_assessment_service
-    return get_assessment_service()
-
-
 def get_assessment_repo() -> AssessmentSessionRepository:
     return get_assessment_session_repository()
 
@@ -169,8 +170,8 @@ def get_assessment_repo() -> AssessmentSessionRepository:
 # Generator nhận stage từ route, KHÔNG tự suy ra.
 # ==========================================
 
-# Hard cap — Q6: tối đa 4 lượt user cho luồng mở rộng
-HARD_CAP_USER_TURNS = 4
+# Initial STA path: 3 turns, or 4 for fatigued users; explicit extension +3.
+HARD_CAP_USER_TURNS = 7
 
 # Q-C / Q-D: Crisis KHÔNG bị đóng bởi turn cap
 # Khi crisis_active=true, route BYPASS turn cap ở bước tính stage.
@@ -207,48 +208,26 @@ def decide_stage(
     Q-D: Khi session từng crisis (is_crisis_active=true) mà msg mới OK,
          cho phép tiếp tục bình thường, stage tính theo turn.
     """
-    # Crisis mới ưu tiên tuyệt đối
     if new_msg_is_crisis:
         return "crisis_support", False, True, None
-
+    base_end = 4 if (was_extended or is_fatigued_short) else 3
+    if user_extended and current_turn_count > base_end:
+        offset = current_turn_count - base_end
+        stage = {1: "clarifying_cause", 2: "reflect_and_support"}.get(offset, "wrapping_up")
+        return stage, offset >= 3, offset < 3, was_extended
     if current_turn_count <= 1:
         return "greeting_and_probe", False, True, False
     if current_turn_count == 2:
-        if is_fatigued_short:
-            return "clarifying_cause", False, True, True  # mở rộng tự động (fatigued)
-        return "reflect_and_support", False, True, False
-    if current_turn_count == 3:
-        if was_extended:
-            return "reflect_and_support", False, True, True
-        if user_extended:
-            return "clarifying_cause", False, True, False
-        return "wrapping_up", True, False, False
-    if current_turn_count == 4:
-        if was_extended:
-            if user_extended:
-                return "clarifying_cause", False, True, True
-            return "wrapping_up", True, False, True
-        if user_extended:
-            return "reflect_and_support", False, True, False
-        return "wrapping_up", True, False, False
-    if current_turn_count == 5:
-        if was_extended and user_extended:
-            return "reflect_and_support", False, True, True
-        if user_extended:
-            return "wrapping_up", True, False, False
-        return "wrapping_up", True, False, False
-    if current_turn_count == 6:
-        if was_extended and user_extended:
-            return "wrapping_up", True, False, True
-        return "wrapping_up", True, False, False
-
-    # HARD CAP (kể cả đã gia hạn hay crisis đã clear - tối đa 7 turns)
+        return ("clarifying_cause", False, True, True) if is_fatigued_short else ("reflect_and_support", False, True, False)
+    if current_turn_count < base_end:
+        return "reflect_and_support", False, True, was_extended
     return "wrapping_up", True, False, was_extended
 
 
 def _build_idempotent_replay(
     existing_user_msg: dict,
     chat_session_repo: ChatSessionRepository,
+    chat_repo: Optional[ChatHistoryRepository] = None,
 ) -> dict:
     """Q5: Trả response giống hệt cho request retry cùng client_message_id.
 
@@ -258,12 +237,12 @@ def _build_idempotent_replay(
     from app.modules.chat.repositories.chat_history_repository import (
         get_chat_history_repository,
     )
-    chat_repo = get_chat_history_repository()
+    chat_repo = chat_repo or get_chat_history_repository()
     assessment_id = existing_user_msg.get("assessment_id")
     session_id = existing_user_msg.get("session_id")
 
     # Tìm assistant message gần nhất sau user message
-    history = chat_repo.get_messages_by_assessment(assessment_id, limit=50)
+    history = chat_repo.get_messages_by_session(session_id, limit=1000) if session_id else chat_repo.get_messages_by_assessment(assessment_id, limit=1000)
     user_idx = None
     for i, m in enumerate(history):
         if m.get("id") == existing_user_msg.get("id"):
@@ -273,6 +252,8 @@ def _build_idempotent_replay(
     assistant_msg = None
     if user_idx is not None:
         for j in range(user_idx + 1, len(history)):
+            if history[j].get("role") == "user":
+                break
             if history[j].get("role") == "assistant":
                 assistant_msg = history[j]
                 break
@@ -316,6 +297,10 @@ def _build_idempotent_replay(
         "user_turn_count": user_turn_count,
         "micro_action_offered": getattr(sess, "micro_action_offered", None) if sess else None,
         "primary_cause": getattr(sess, "primary_cause", None) if sess else None,
+        "can_extend": _session_state(sess, chat_session_repo).get("can_extend", False),
+        "user_extended": bool(sess and sess.user_extended),
+        "is_fallback": bool(assistant_msg and assistant_msg.get("is_fallback")),
+        "finish_reason": assistant_msg.get("finish_reason") if assistant_msg else None,
         "idempotent_replay": True,
     }
 
@@ -324,629 +309,208 @@ def _build_idempotent_replay(
 # Endpoints
 # ==========================================
 
+def _owned_assessment(assessment_id, user, assessment_repo):
+    assessment = assessment_repo.get(assessment_id)
+    if not assessment:
+        raise HTTPException(404, "Assessment not found")
+    if assessment.get("user_id") != user["uid"]:
+        raise HTTPException(403, "Not authorized")
+    return assessment
+
+
+async def _release_claim(ledger, claim):
+    try:
+        await asyncio.to_thread(ledger.release, claim)
+    except Exception:
+        # A committed reply stays valid even if a subsequent cleanup read fails.
+        # Unfinished claims expire and cannot overwrite a newer worker's turn.
+        logger.warning("Unable to release chat operation claim")
+
+
+def _latest_session(repo, assessment_id):
+    sessions = repo.get_sessions_by_assessment(assessment_id, limit=1)
+    return sessions[0] if sessions else None
+
+
+def _session_state(session, repo):
+    if not session:
+        return {"status": "none", "can_reply": False, "can_extend": False,
+                "user_extended": False, "current_stage": None, "user_turn_count": 0,
+                "is_crisis_active": False, "is_expired": False}
+    valid, reason = repo._is_session_valid(session)
+    closed = session.status != "active"
+    return {
+        "status": "closed" if closed else ("active" if valid else "expired"),
+        "session_id": session.id,
+        "can_reply": not closed and valid,
+        "can_extend": bool(valid and session.current_stage == "wrapping_up"
+                           and not session.user_extended
+                           and session.closed_reason == "completed_wrap_up"),
+        "user_extended": session.user_extended,
+        "current_stage": session.current_stage, "user_turn_count": session.user_turn_count,
+        "is_crisis_active": session.is_crisis_active, "is_extended": session.is_extended,
+        "is_expired": not valid, "expired_reason": reason,
+    }
+
+
+def _message_payload(ident, role, content, session_id, now, **metadata):
+    return ChatMessageResponse(message_id=ident, role=role, content=content,
+                               created_at=now.isoformat(), session_id=session_id, **metadata).model_dump()
+
+
 @router.post("/{assessment_id}/chat", response_model=dict)
 async def send_chat_message(
-    assessment_id: str,
-    request: ChatMessageRequest,
+    assessment_id: str, request: ChatMessageRequest,
     user: dict = Depends(get_current_user),
     chat_repo: ChatHistoryRepository = Depends(get_chat_repo),
     chat_session_repo: ChatSessionRepository = Depends(get_chat_session_repo),
-    # Q1: assessment_service KHÔNG còn dùng trong v2.1 (bỏ analyze_chat_text).
-    # Giữ parameter để tránh vỡ DI container ở những nơi khác (route này
-    # không gọi nhưng DI vẫn resolve). Có thể xóa sau khi verify
-    # không còn consumer nào dùng.
-    assessment_service: AssessmentService = Depends(get_assessment_svc),  # noqa: ARG001
     assessment_repo: AssessmentSessionRepository = Depends(get_assessment_repo),
 ):
-    """
-    Gửi tin nhắn chat và phân tích bằng AI.
-
-    Flow:
-    1. Verify ownership - assessment phải thuộc về user
-    2. Find or create session (với session management)
-    3. Save user message vào Firestore
-    4. Nếu analyze=True -> gọi AI phân tích
-    5. Tạo assistant response message với feedback
-    6. Update session last_activity
-    7. Trả cả user message và assistant response
-    """
-    user_id = user["uid"]
-
-    # 1. Verify assessment ownership
-    assessment = assessment_repo.get(assessment_id)
-    if not assessment:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Assessment not found",
-        )
-    if assessment.get("user_id") != user_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to send message to this assessment",
-        )
-
-    # 2. Update assessment status - mark chat as started
-    if not assessment.get("status_detail", {}).get("has_chat"):
-        assessment_repo.mark_chat_started(assessment_id)
-
-    # 3. Soft Boundary Check: Kiểm tra session đã đóng trước đó
-    active_session = chat_session_repo.get_active_session(assessment_id)
-    if active_session and active_session.status == "closed":
-        # Trả về thông điệp dặn dò nghỉ ngơi định sẵn, không tạo session mới tự động
-        closed_notice = "Phiên check-in hôm nay của bạn đã hoàn tất để bạn có thời gian nghỉ ngơi. Hẹn gặp lại bạn vào ngày mai nhé!"
-        return {
-            "user_message": ChatMessageResponse(
-                message_id="closed_notice",
-                role="user",
-                content=request.message,
-                created_at=datetime.utcnow().isoformat(),
-                session_id=active_session.id,
-                can_reply=False,
-            ).model_dump(),
-            "assistant_message": ChatMessageResponse(
-                message_id="closed_assistant",
-                role="assistant",
-                content=closed_notice,
-                created_at=datetime.utcnow().isoformat(),
-                session_id=active_session.id,
-                can_reply=False,
-            ).model_dump(),
-            "is_session_completed": True,
-            "session_status": "closed",
-        }
-
-    # 4. Find or create active session
-    session_result = chat_session_repo.find_or_create_session(assessment_id, user_id)
-    session_id = session_result.session_id
-    session_message = session_result.message
-
-    # 5. Handle empty or punctuation-only messages (TC_D02)
-    cleaned_msg = request.message.strip()
-    if not cleaned_msg or cleaned_msg in [".", "..", "...", "....", "....."]:
-        soft_reply = "Tôi vẫn đang ở đây lắng nghe bạn. Khi nào bạn sẵn sàng chia sẻ, cứ nhắn cho tôi nhé."
-        return {
-            "user_message": ChatMessageResponse(
-                message_id="punct_msg",
-                role="user",
-                content=request.message,
-                created_at=datetime.utcnow().isoformat(),
-                session_id=session_id,
-                can_reply=True,
-            ).model_dump(),
-            "assistant_message": ChatMessageResponse(
-                message_id="punct_reply",
-                role="assistant",
-                content=soft_reply,
-                created_at=datetime.utcnow().isoformat(),
-                session_id=session_id,
-                can_reply=True,
-            ).model_dump(),
-            "is_session_completed": False,
-            "session_status": "active",
-        }
-
-    # 6. Pre-filter Crisis Safety Interlock (P0) TRƯỚC KHI gọi bất kỳ LLM nào
+    assessment = _owned_assessment(assessment_id, user, assessment_repo)
     is_crisis, crisis_response = evaluate_crisis_safety(request.message)
-    if is_crisis and crisis_response:
-        # Q-D: Crisis KHÔNG đóng session (GAP-4 fix). Set is_crisis_active=True
-        # + stage=crisis_support. Session vẫn mở để user có thể chat tiếp
-        # và nhận hỗ trợ liên tục.
-        chat_session_repo.update_stage(
-            session_id, "crisis_support", is_crisis_active=True
-        )
-        user_message_id = chat_repo.save_message(
-            assessment_id=assessment_id,
-            user_id=user_id,
-            role="user",
-            content=request.message,
-            session_id=session_id,
-            client_message_id=request.client_message_id,
-        )
-        assistant_message_id = chat_repo.save_message(
-            assessment_id=assessment_id,
-            user_id=user_id,
-            role="assistant",
-            content=crisis_response,
-            session_id=session_id,
-        )
-        return {
-            "user_message": ChatMessageResponse(
-                message_id=user_message_id,
-                role="user",
-                content=request.message,
-                created_at=datetime.utcnow().isoformat(),
-                session_id=session_id,
-                can_reply=True,
-            ).model_dump(),
-            "assistant_message": ChatMessageResponse(
-                message_id=assistant_message_id,
-                role="assistant",
-                content=crisis_response,
-                created_at=datetime.utcnow().isoformat(),
-                session_id=session_id,
-                can_reply=True,
-            ).model_dump(),
-            "is_session_completed": False,   # GAP-4: session vẫn mở
-            "session_status": "crisis_support",
-            "current_stage": "crisis_support",
-            "user_turn_count": 0,           # Crisis không tăng turn
-            "micro_action_offered": None,
-            "primary_cause": None,
+    ledger = ChatRequestRepository(chat_repo.db)
+    try:
+        claim = await asyncio.to_thread(ledger.claim, assessment_id, user["uid"],
+                                        request.client_message_id or uuid4().hex, "send", request.message)
+    except ChatRequestConflict as exc:
+        # Never withhold immediate safety support behind a busy chat worker.
+        if is_crisis:
+            return {"assistant_message": _message_payload("safety-pending", "assistant", crisis_response,
+                    None, datetime.now(timezone.utc), can_reply=True), "current_stage": "crisis_support",
+                    "is_session_completed": False, "session_status": "crisis_support", "persistence_pending": True}
+        raise HTTPException(409, {"code": str(exc), "message": "Tin nhắn đang được xử lý. Hãy thử lại cùng tin nhắn."})
+    if "response" in claim:
+        return {**claim["response"], "idempotent_replay": True}
+    try:
+        # Compatibility with requests stored before the operation ledger existed.
+        if request.client_message_id:
+            existing = chat_repo.get_by_client_message_id(assessment_id, request.client_message_id)
+            if existing:
+                if existing.get("content") != request.message:
+                    raise HTTPException(409, {"code": "MESSAGE_ID_REUSED"})
+                replay = _build_idempotent_replay(existing, chat_session_repo, chat_repo)
+                await asyncio.to_thread(ledger.complete, claim, replay)
+                return replay
+
+        latest = _latest_session(chat_session_repo, assessment_id)
+        if latest and latest.status == "closed" and latest.closed_reason not in {"idle_timeout", "max_duration"} and not is_crisis:
+            raise HTTPException(409, {"code": "CHAT_SESSION_CLOSED", **_session_state(latest, chat_session_repo)})
+        result = chat_session_repo.find_or_create_session(assessment_id, user["uid"])
+        session = chat_session_repo.get_session(result.session_id)
+        if not session:
+            raise HTTPException(409, {"code": "CHAT_SESSION_CHANGED"})
+        before = session.user_turn_count
+        now = datetime.now(timezone.utc)
+        if not request.message.strip() or request.message.strip() in {".", "..", "...", "....", "....."}:
+            response = {"assistant_message": _message_payload("punctuation", "assistant",
+                "Tôi vẫn đang ở đây lắng nghe bạn. Khi nào sẵn sàng, bạn cứ nhắn nhé.", session.id, now),
+                "user_message": _message_payload("punctuation-user", "user", request.message, session.id, now),
+                "is_session_completed": False, "session_status": "active", "can_extend": False,
+                "user_extended": session.user_extended, "is_fallback": False}
+            await asyncio.to_thread(ledger.complete, claim, response)
+            return response
+
+        fatigued = is_fatigued_short_message(request.message) if before == 0 else session.was_fatigued_turn1
+        stage, completed, can_reply, extended = decide_stage(before + 1, session.is_crisis_active,
+            fatigued, session.is_extended, is_crisis, session.user_extended)
+        turn = before if is_crisis else before + 1
+        topic, action = session.primary_cause, session.micro_action_offered
+        fallback, finish = False, "CRISIS_SUPPORT" if is_crisis else None
+        facts = []
+        if is_crisis:
+            content = crisis_response
+        else:
+            history = chat_repo.get_messages_by_session(session.id, limit=50)
+            survey = await asyncio.to_thread(_build_survey_context_sync, assessment_id, user["uid"])
+            generator = get_chat_response_generator()
+            response = await asyncio.to_thread(generator.generate_response,
+                user_message=request.message, stage=stage, conversation_history=history,
+                survey_context=survey, session_id=session.id, assessment_id=assessment_id,
+                message_count=turn, primary_cause=topic, micro_action=action)
+            content, fallback, finish = response.content, response.is_fallback, response.finish_reason
+            if stage == "reflect_and_support" and response.follow_up_topic not in (None, "general"):
+                topic, action = response.follow_up_topic, response.micro_action
+            facts = get_probing_questions_service().extract_facts(request.message)
+            if finish == "USER_STOPPED":
+                completed, can_reply = True, False
+        can_extend = bool(completed and stage == "wrapping_up" and not session.user_extended and finish != "USER_STOPPED")
+        ui_action = {"type": "offer_extension"} if can_extend else None
+        metadata = dict(can_reply=can_reply, can_extend=can_extend, user_extended=session.user_extended, ui_action=ui_action)
+        user_ref, assistant_ref = chat_repo.collection.document(), chat_repo.collection.document()
+        # Firestore breaks equal timestamp ties by document ID. Keep the pair
+        # ordered even though both documents are committed in one transaction.
+        assistant_time = max(datetime.now(timezone.utc), now + timedelta(microseconds=1))
+        payload = {
+            "user_message": _message_payload(user_ref.id, "user", request.message, session.id, now, **metadata),
+            "assistant_message": _message_payload(assistant_ref.id, "assistant", content, session.id, assistant_time,
+                is_fallback=fallback, finish_reason=finish, **metadata),
+            "is_session_completed": completed, "session_status": "closed" if completed else "active",
+            "current_stage": stage, "user_turn_count": turn, "can_extend": can_extend,
+            "user_extended": session.user_extended, "ui_action": ui_action,
+            "micro_action_offered": action, "primary_cause": topic,
+            "is_fallback": fallback, "finish_reason": finish,
         }
-
-    # 7. Q5: Idempotency check — nếu client_message_id đã tồn tại, trả về
-    # response cũ thay vì xử lý lại (chống duplicate khi retry).
-    if request.client_message_id:
-        existing = chat_repo.get_by_client_message_id(
-            assessment_id, request.client_message_id
-        )
-        if existing:
-            logger.info(
-                "Idempotent replay detected (client_msg_id=%s). Returning cached response.",
-                request.client_message_id,
-            )
-            return _build_idempotent_replay(existing, chat_session_repo)
-
-    # 8. Đọc flags hiện tại (is_extended, is_crisis_active, was_fatigued_turn1, user_extended) TRƯỚC khi transaction
-    session_flags = chat_session_repo.get_session_flags(session_id)
-    was_extended = session_flags["is_extended"]
-    was_crisis_active = session_flags["is_crisis_active"]
-    persisted_fatigued_turn1 = session_flags.get("was_fatigued_turn1", False)
-    was_user_extended = session_flags.get("user_extended", False)
-
-    # 9. B1: State machine pure function (single source of truth)
-    current_turn_before = chat_session_repo.get_user_turn_count(session_id)
-    # Ở Lượt 1: kiểm tra xem message có cực ngắn thể hiện kiệt sức không
-    is_turn1_msg_fatigued = is_fatigued_short_message(request.message) if current_turn_before == 0 else False
-    # Ở Lượt 2+: dùng cờ persisted_fatigued_turn1 đã ghi lại từ lượt 1
-    effective_fatigued_flag = is_turn1_msg_fatigued if current_turn_before == 0 else persisted_fatigued_turn1
-
-    current_stage, is_session_completed, can_reply, next_is_extended = decide_stage(
-        current_turn_count=current_turn_before + 1,
-        is_crisis_active=was_crisis_active,
-        is_fatigued_short=effective_fatigued_flag,
-        was_extended=was_extended,
-        new_msg_is_crisis=False,  # crisis đã chặn ở step 6
-        user_extended=was_user_extended,
-    )
-
-    # 10. Q5 / GAP-8: Atomic transaction — increment + update stage + flags
-    # KHÔNG gọi Gemini bên trong transaction (Firestore transactions retry).
-    try:
-        new_turn_count = chat_session_repo.process_message_atomically(
-            session_id=session_id,
-            new_stage=current_stage,
-            is_extended=next_is_extended,
-            is_crisis_active=False,
-            increment_turn=True,
-            was_fatigued_turn1=is_turn1_msg_fatigued if current_turn_before == 0 else None,
-        )
-    except ValueError as exc:
-        logger.error("Session %s disappeared: %s", session_id, exc)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Session not available",
-        )
-
-    # 11. Đọc history SAU khi đã commit (để dùng cho prompt)
-    history = chat_repo.get_messages_by_assessment(assessment_id, limit=50)
-    user_turn_count = new_turn_count
-
-    ui_action = None
-
-    # 12. Q1: KHÔNG gọi analyze_chat_text trong luồng chat đồng bộ.
-    # `/chat/summary` sẽ trả aggregated_stress_level=null khi không có analysis.
-    # Frontend Signal Panel hiển thị placeholder.
-    # Xóa toàn bộ block gọi assessment_service.analyze_chat_text.
-
-    # 13. Build survey context (giữ — vẫn dùng cho prompt greeting)
-    history_for_ai = [
-        {"role": m.get("role"), "content": m.get("content", "")} for m in history
-    ]
-    survey_context = None
-    try:
-        from app.modules.survey.repositories.survey_history_repository import (
-            get_survey_history_repository,
-        )
-        from app.modules.user.services.user_profile_service import get_profile_service
-        from app.modules.burnout.helpers.industry_archetypes import (
-            resolve_industry_context,
-        )
-        from app.modules.burnout.helpers.matrix_resolver import (
-            resolve_burnout_archetype,
-        )
-
-        profile = get_profile_service().get_profile(user_id) or {}
-        job_title = profile.get("job_title")
-        industry_code = profile.get("industry_code")
-        ind_ctx = resolve_industry_context(
-            industry_code=industry_code, job_title=job_title
-        )
-
-        survey_repo = get_survey_history_repository()
-        survey_doc = survey_repo.get_by_assessment(assessment_id)
-        if not survey_doc:
-            recent_s = survey_repo.list_by_user(user_id, limit=1)
-            if recent_s:
-                survey_doc = recent_s[0]
-
-        if survey_doc:
-            s_data = survey_doc.get("survey") or {}
-            if s_data.get("survey_type") in ("daily_checkin", "olbi_periodic"):
-                from app.modules.survey.services.questionnaire_scoring import engine_survey
-                s_data = engine_survey(s_data)
-            ai_insight = (survey_doc.get("analysis_result") or {}).get(
-                "ai_insight"
-            ) or {}
-            quick_data = s_data.get("quick_overload_data") or {}
-            rec_data = s_data.get("recovery") or {}
-            reasons = (
-                s_data.get("overload_reasons")
-                or quick_data.get("reasons")
-                or []
-            )
-
-            ex_score = 3.0
-            if s_data.get("exhaustion"):
-                v = [
-                    float(val)
-                    for val in s_data["exhaustion"].values()
-                    if val is not None
-                ]
-                if v:
-                    ex_score = sum(v) / len(v)
-
-            dis_score = 2.5
-            if s_data.get("disengagement"):
-                v = [
-                    float(val)
-                    for val in s_data["disengagement"].values()
-                    if val is not None
-                ]
-                if v:
-                    dis_score = sum(v) / len(v)
-
-            daily_stats = {
-                "job_demands": 3.0,
-                "sleep_hours": s_data.get("sleep_hours")
-                or rec_data.get("sleep_hours")
-                or 7.0,
-                "recovery_score": s_data.get("recovery_score")
-                or rec_data.get("recovery_score")
-                or 3,
-                "quick_overload": s_data.get("quick_overload")
-                or quick_data.get("rating")
-                or 2,
-                "overload_reasons": reasons,
-                "overtime_hours": s_data.get("overtime_hours") or 0.0,
-            }
-            archetype = resolve_burnout_archetype(ex_score, dis_score, daily_stats)
-
-            survey_context = {
-                "job_title": job_title or ind_ctx.typical_roles[0],
-                "industry_name": ind_ctx.name,
-                "archetype_name": "Hai chiều OLBI; chưa xác định hình mẫu" if s_data.get("survey_type") == "olbi_periodic" else f"{archetype.icon} {archetype.name}",
-                "reflection_question": ai_insight.get("reflection_question", ""),
-                "overload_reasons": reasons,
-                "sleep_hours": None if s_data.get("survey_type") == "olbi_periodic" else daily_stats["sleep_hours"],
-                "recovery_score": None if s_data.get("survey_type") == "olbi_periodic" else daily_stats["recovery_score"],
-            }
-    except Exception as exc:
-        logger.debug("Failed to build survey context: %s", exc)
-
-    # 14. Gọi generator với stage ĐÃ ĐƯỢC ROUTE QUYẾT (B1)
-    analysis_data = None  # Q1: không còn analysis cho chat
-    ai_model = None
-    assistant_content = None
-    response_is_fallback = False
-    response_finish_reason = None
-    try:
-        response_generator = get_chat_response_generator()
-        chat_response = await asyncio.to_thread(
-            response_generator.generate_response,
-            user_message=request.message,
-            stage=current_stage,                  # BẮT BUỘC từ route
-            conversation_history=history_for_ai,
-            survey_context=survey_context,
-            session_id=session_id,
-            assessment_id=assessment_id,
-            message_count=user_turn_count,
-        )
-        assistant_content = chat_response.content
-        response_is_fallback = chat_response.is_fallback
-        response_finish_reason = chat_response.finish_reason
-        logger.info("Chat generation stage=%s fallback=%s finish_reason=%s", current_stage, response_is_fallback, response_finish_reason)
-
-        # 15. Context Tagging — chỉ ghi ở stage reflect_and_support
-        # PR 2: Dùng cached topic từ generator (chat_response.follow_up_topic) thay vì
-        # gọi lại probing_service lần 2. Tiết kiệm 1 Firestore read + 1 write.
-        if current_stage == "reflect_and_support":
+        common = {"assessment_id": assessment_id, "user_id": user["uid"], "session_id": session.id, "analysis": None}
+        updates = {"current_stage": stage, "user_turn_count": turn, "message_count": session.message_count + 2,
+                   "is_extended": session.is_extended if extended is None else extended,
+                   "is_crisis_active": is_crisis, "was_fatigued_turn1": fatigued,
+                   "last_activity_at": assistant_time, "updated_at": assistant_time,
+                   "primary_cause": topic, "micro_action_offered": action}
+        if facts:
+            updates.update(context_facts=firestore.ArrayUnion(facts), last_analysis_confidence=0.7)
+        if completed:
+            updates.update(status="closed", closed_at=assistant_time,
+                closed_reason="manual" if finish == "USER_STOPPED" else ("max_turns_completed" if session.user_extended else "completed_wrap_up"),
+                summary=content[:300])
+        writes = [
+            (user_ref, {**common, "role": "user", "content": request.message, "created_at": now, "client_message_id": request.client_message_id}, False),
+            (assistant_ref, {**common, "role": "assistant", "content": content,
+                "created_at": assistant_time, "response_to": user_ref.id, "is_fallback": fallback, "finish_reason": finish}, False),
+            (chat_session_repo.collection.document(session.id), updates, True),
+        ]
+        await asyncio.to_thread(ledger.complete, claim, payload, writes,
+            (chat_session_repo.collection.document(session.id), before))
+        if not assessment.get("status_detail", {}).get("has_chat"):
+            # Peripheral assessment marker must not invalidate a committed reply.
             try:
-                cached_topic = chat_response.follow_up_topic if chat_response else None
-                if cached_topic and cached_topic != "general":
-                    # Lấy micro_action từ generator cache (nếu có) hoặc fallback
-                    from app.modules.chat.services.probing_questions import get_probing_questions_service
-                    probe_obj = get_probing_questions_service()
-                    cached_question = probe_obj.get_probing_question(
-                        user_message=request.message,
-                        survey_context=survey_context,
-                        session_id=session_id,
-                        assessment_id=assessment_id,
-                    )
-                    if cached_question:
-                        chat_session_repo.update_session_tagging(
-                            session_id=session_id,
-                            primary_cause=cached_topic,
-                            micro_action_offered=cached_question.micro_action,
-                        )
-            except Exception as tag_exc:
-                logger.debug("Context tagging skipped: %s", tag_exc)
-
-        # PR 2: Lưu context_facts lên session (cho dashboard/lần sau)
-        try:
-            from app.modules.chat.services.probing_questions import get_probing_questions_service
-            probe_svc = get_probing_questions_service()
-            facts = probe_svc.extract_facts(request.message)
-            if facts:
-                chat_session_repo.update_context_analysis(
-                    session_id=session_id,
-                    context_facts=facts,
-                    confidence=0.7,  # Heuristic-based, không dùng LLM
-                )
-        except Exception as ctx_exc:
-            logger.debug("update_context_analysis skipped: %s", ctx_exc)
-    except Exception as exc:
-        logger.warning("Chat AI response generation failed: %s", exc)
-        # Q-C: fallback do generator tự xử lý; nhưng nếu generator raise
-        # exception khác (không phải Gemini), generator đã trả ChatResponse
-        # rồi. Đoạn này chỉ log warning.
-        if not assistant_content:
-            assistant_content = "Tôi ghi nhận chia sẻ của bạn. Hãy nghỉ ngơi nhé."
-            response_is_fallback = True
-            response_finish_reason = "GENERATION_ERROR"
-
-    # 16. Save user & assistant messages (Q1: bỏ analysis, Q5: truyền client_message_id)
-    user_message_id = chat_repo.save_message(
-        assessment_id=assessment_id,
-        user_id=user_id,
-        role="user",
-        content=request.message,
-        analysis=analysis_data,  # luôn None trong v2.1
-        ai_model=ai_model,
-        session_id=session_id,
-        client_message_id=request.client_message_id,
-    )
-
-    assistant_message_id = None
-    if assistant_content:
-        assistant_message_id = chat_repo.save_message(
-            assessment_id=assessment_id,
-            user_id=user_id,
-            role="assistant",
-            content=assistant_content,
-            analysis=None,
-            ai_model=ai_model,
-            session_id=session_id,
-        )
-
-    # 10. Đóng session nếu chạm mốc hoàn tất
-    if is_session_completed:
-        try:
-            close_reason = "completed_wrap_up" if user_turn_count < 6 else "max_turns_completed"
-            # STA Compact: đọc primary_cause + micro_action_offered đã ghi
-            # ở bước Context Tagging để truyền vào close_session.
-            primary_cause = None
-            micro_action_offered = None
-            try:
-                sess = chat_session_repo.get_session(session_id)
-                if sess:
-                    primary_cause = getattr(sess, "primary_cause", None)
-                    micro_action_offered = getattr(sess, "micro_action_offered", None)
+                assessment_repo.mark_chat_started(assessment_id)
             except Exception:
-                pass
-            chat_session_repo.close_session(
-                session_id=session_id,
-                reason=close_reason,
-                summary=assistant_content[:300] if assistant_content else "Hoàn tất phiên tư vấn tự nhận thức.",
-                primary_cause=primary_cause,
-                micro_action_offered=micro_action_offered,
-            )
-            logger.info("Session %s permanently closed (%s at turn %d)", session_id, close_reason, user_turn_count)
-        except Exception as exc:
-            logger.warning("Failed to close session %s: %s", session_id, exc)
-
-    # 18. Q-Ext: Kiểm tra xem phiên có thể đề xuất gia hạn không
-    # Điều kiện: stage là wrapping_up VÀ chưa từng gia hạn trước đó (user_extended == False)
-    can_extend = bool(current_stage == "wrapping_up" and not was_user_extended)
-    ui_action = None
-    if can_extend:
-        ui_action = {
-            "type": "offer_extension",
-            "prompt": "Bạn đã thấy nhẹ lòng hơn để nghỉ ngơi chưa, hay vẫn còn điều gì muốn chia sẻ thêm?",
-            "buttons": [
-                {"id": "rest", "label": "Tôi đã ổn, muốn nghỉ ngơi", "action": "close"},
-                {"id": "extend", "label": "Tôi muốn chia sẻ thêm (+3 lượt)", "action": "extend"},
-            ],
-        }
-
-    # Response payload (Q1: bỏ field `analysis`)
-    response_payload = {
-        "user_message": ChatMessageResponse(
-            message_id=user_message_id,
-            role="user",
-            content=request.message,
-            created_at=datetime.utcnow().isoformat(),
-            session_id=session_id,
-            can_reply=can_reply,
-            can_extend=can_extend,
-            user_extended=was_user_extended,
-            ui_action=ui_action,
-        ).model_dump(),
-        "assistant_message": ChatMessageResponse(
-            message_id=assistant_message_id or "",
-            role="assistant",
-            content=assistant_content or "...",
-            created_at=datetime.utcnow().isoformat(),
-            session_id=session_id,
-            can_reply=can_reply,
-            can_extend=can_extend,
-            user_extended=was_user_extended,
-            ui_action=ui_action,
-        ).model_dump() if assistant_content else None,
-        "is_session_completed": is_session_completed,
-        "session_status": "closed" if is_session_completed else "active",
-        "current_stage": current_stage,
-        "is_fallback": response_is_fallback,
-        "finish_reason": response_finish_reason,
-        "user_turn_count": user_turn_count,
-        "can_extend": can_extend,
-        "user_extended": was_user_extended,
-        "ui_action": ui_action,
-        "micro_action_offered": None,
-        "primary_cause": None,
-    }
-
-    if is_session_completed:
-        try:
-            sess = chat_session_repo.get_session(session_id)
-            if sess:
-                response_payload["micro_action_offered"] = getattr(
-                    sess, "micro_action_offered", None
-                )
-                response_payload["primary_cause"] = getattr(
-                    sess, "primary_cause", None
-                )
-        except Exception:
-            pass
-
-    return response_payload
+                logger.warning("Unable to update assessment chat marker")
+        return payload
+    except ChatRequestConflict as exc:
+        raise HTTPException(409, {"code": str(exc)})
+    finally:
+        await _release_claim(ledger, claim)
 
 
 @router.get("/{assessment_id}/chat", response_model=ChatHistoryResponse)
 async def get_chat_history(
-    assessment_id: str,
-    limit: int = 50,
-    user: dict = Depends(get_current_user),
+    assessment_id: str, limit: int = 50, user: dict = Depends(get_current_user),
     chat_repo: ChatHistoryRepository = Depends(get_chat_repo),
     chat_session_repo: ChatSessionRepository = Depends(get_chat_session_repo),
+    assessment_repo: AssessmentSessionRepository = Depends(get_assessment_repo),
 ):
-    """Lay lich su chat cua mot assessment."""
-    user_id = user["uid"]
-
-    messages = chat_repo.get_messages_by_assessment(assessment_id, limit=limit)
-
-    # Filter de dam bao user chi thay message cua ho
-    if messages and messages[0].get("user_id") != user_id:
-        raise HTTPException(status_code=403, detail="Not authorized to view this chat")
-
-    has_analysis = any(m.get("analysis") for m in messages)
-
-    # Get current active session
-    current_session = chat_session_repo.get_active_session(assessment_id)
-
-    # Kiem tra session con hop le khong - neu khong thi close va tao moi
-    if current_session:
-        is_valid, invalid_reason = chat_session_repo._is_session_valid(current_session)
-        if not is_valid:
-            logger.info(
-                "Active session %s expired (reason=%s), closing",
-                current_session.id, invalid_reason
-            )
-            chat_session_repo.close_session(
-                session_id=current_session.id,
-                reason=invalid_reason,
-                summary=None
-            )
-            current_session = None
-
-    current_session_id = current_session.id if current_session else None
-
-    user_msgs_count = len([m for m in messages if m.get("role") == "user"])
-    is_closed = (current_session is None and len(messages) > 0) or user_msgs_count >= 10
-    if current_session and current_session.status != "active":
-        is_closed = True
-
-    # Xác định khả năng gia hạn
-    can_extend = False
-    user_extended = False
-    if current_session:
-        user_extended = bool(getattr(current_session, "user_extended", False))
-        can_extend = bool(current_session.current_stage == "wrapping_up" and not user_extended)
-    else:
-        recent = chat_session_repo.get_sessions_by_assessment(assessment_id, limit=1)
-        if recent:
-            user_extended = bool(getattr(recent[0], "user_extended", False))
-            can_extend = bool(getattr(recent[0], "current_stage", None) == "wrapping_up" and not user_extended)
-
-    return ChatHistoryResponse(
-        assessment_id=assessment_id,
-        messages=messages,
-        message_count=len(messages),
-        has_analysis=has_analysis,
-        current_session_id=current_session_id,
-        is_closed=is_closed,
-        can_extend=can_extend,
-        user_extended=user_extended,
-    )
+    _owned_assessment(assessment_id, user, assessment_repo)
+    session = _latest_session(chat_session_repo, assessment_id)
+    state = _session_state(session, chat_session_repo)
+    limit = max(1, min(limit, 100))
+    messages = (chat_repo.get_messages_by_session(session.id, limit=limit) if session
+                else chat_repo.get_messages_by_assessment(assessment_id, limit=limit))
+    return ChatHistoryResponse(assessment_id=assessment_id, messages=messages,
+        message_count=len(messages), has_analysis=any(m.get("analysis") for m in messages),
+        current_session_id=session.id if session else None,
+        is_closed=state["status"] in {"closed", "expired"},
+        can_extend=state["can_extend"], user_extended=state["user_extended"])
 
 
 @router.get("/{assessment_id}/chat/state", response_model=dict)
 async def get_chat_state(
-    assessment_id: str,
-    user: dict = Depends(get_current_user),
+    assessment_id: str, user: dict = Depends(get_current_user),
     chat_session_repo: ChatSessionRepository = Depends(get_chat_session_repo),
     assessment_repo: AssessmentSessionRepository = Depends(get_assessment_repo),
 ):
-    """Q3: Trả về trạng thái phiên hiện tại (idempotent, rất nhẹ).
-
-    Dùng cho frontend đồng bộ state khi lỗi mạng. KHÔNG tự đoán session
-    đóng/mở — backend là nguồn xác thực cuối cùng.
-    """
-    # 1. Verify ownership
-    assessment = assessment_repo.get(assessment_id)
-    if not assessment:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Assessment not found",
-        )
-    if assessment.get("user_id") != user["uid"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized",
-        )
-
-    # 2. Đọc session
-    session = chat_session_repo.get_active_session(assessment_id)
-    if not session:
-        return {
-            "status": "none",
-            "can_reply": False,
-            "can_extend": False,
-            "user_extended": False,
-            "current_stage": None,
-            "user_turn_count": 0,
-            "is_crisis_active": False,
-            "is_expired": False,
-        }
-
-    # 3. Check validity (idle/max duration)
-    is_valid, invalid_reason = chat_session_repo._is_session_valid(session)
-    is_expired = not is_valid
-    user_extended = bool(getattr(session, "user_extended", False))
-    can_extend = bool(session.current_stage == "wrapping_up" and not user_extended)
-
-    return {
-        "status": "active" if (is_valid and session.status == "active") else "expired",
-        "can_reply": is_valid and session.status == "active",
-        "can_extend": can_extend,
-        "user_extended": user_extended,
-        "current_stage": session.current_stage,
-        "user_turn_count": getattr(session, "user_turn_count", 0),
-        "is_crisis_active": bool(getattr(session, "is_crisis_active", False)),
-        "is_extended": bool(getattr(session, "is_extended", False)),
-        "is_expired": is_expired,
-        "expired_reason": invalid_reason,
-    }
+    _owned_assessment(assessment_id, user, assessment_repo)
+    return _session_state(_latest_session(chat_session_repo, assessment_id), chat_session_repo)
 
 
 @router.get("/{assessment_id}/chat/summary", response_model=ChatSummaryResponse)
@@ -1021,134 +585,69 @@ async def delete_chat_history(
 
 @router.post("/{assessment_id}/chat/extend", response_model=dict)
 async def extend_chat_session(
-    assessment_id: str,
-    user: dict = Depends(get_current_user),
+    assessment_id: str, user: dict = Depends(get_current_user),
     chat_repo: ChatHistoryRepository = Depends(get_chat_repo),
     chat_session_repo: ChatSessionRepository = Depends(get_chat_session_repo),
     assessment_repo: AssessmentSessionRepository = Depends(get_assessment_repo),
 ):
-    """
-    Gia hạn phiên trò chuyện (User-driven extension +3 lượt).
-    Cho phép người dùng tiếp tục đào sâu thêm khi chưa muốn dừng ở lượt 3/4.
-    """
-    user_id = user["uid"]
-    assessment = assessment_repo.get(assessment_id)
-    if not assessment:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Assessment not found",
-        )
-    if assessment.get("user_id") != user_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized for this assessment",
-        )
-
-    # Tìm session gần nhất của assessment
-    session = chat_session_repo.get_active_session(assessment_id)
-    if not session:
-        recent_sessions = chat_session_repo.get_sessions_by_assessment(assessment_id, limit=1)
-        if recent_sessions:
-            session = recent_sessions[0]
-
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No chat session found to extend",
-        )
-
-    # Kiểm tra xem session đã từng gia hạn chưa (chỉ được gia hạn 1 lần)
-    if getattr(session, "user_extended", False):
-        return {
-            "success": False,
-            "message": "Phiên này đã được gia hạn trước đó. Hãy hoàn thành các lượt trao đổi hiện tại.",
-            "session_id": session.id,
-            "session_status": session.status,
-            "user_extended": True,
-            "can_reply": session.status == "active",
-        }
-
-    # Kích hoạt gia hạn
-    success = chat_session_repo.extend_session(session.id)
-    if not success:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to extend chat session",
-        )
-
-    # Thêm tin nhắn mời mở rộng từ Assistant
-    invite_text = (
-        "Tôi luôn sẵn lòng đồng hành và lắng nghe bạn. "
-        "Hãy thoải mái chia sẻ thêm về góc nhìn hay những khó khăn bạn đang trải qua nhé."
-    )
-    asst_msg_id = chat_repo.save_message(
-        assessment_id=assessment_id,
-        user_id=user_id,
-        role="assistant",
-        content=invite_text,
-        session_id=session.id,
-    )
-
-    return {
-        "success": True,
-        "message": "Phiên trò chuyện đã được gia hạn thêm 3 lượt.",
-        "session_id": session.id,
-        "session_status": "active",
-        "user_extended": True,
-        "can_reply": True,
-        "assistant_message": {
-            "message_id": asst_msg_id,
-            "role": "assistant",
-            "content": invite_text,
-            "created_at": datetime.utcnow().isoformat(),
-            "session_id": session.id,
-            "can_reply": True,
-        },
-    }
+    _owned_assessment(assessment_id, user, assessment_repo)
+    ledger = ChatRequestRepository(chat_repo.db)
+    try:
+        claim = await asyncio.to_thread(ledger.claim, assessment_id, user["uid"], uuid4().hex, "extend")
+    except ChatRequestConflict as exc:
+        raise HTTPException(409, {"code": str(exc)})
+    try:
+        session = _latest_session(chat_session_repo, assessment_id)
+        state = _session_state(session, chat_session_repo)
+        if session and session.user_extended:
+            return {"success": state["can_reply"], **state, "message": "Phiên này đã được gia hạn trước đó."}
+        if not state["can_extend"]:
+            raise HTTPException(409, {"code": "CHAT_CANNOT_EXTEND", **state})
+        now = datetime.now(timezone.utc)
+        content = "Mình vẫn ở đây lắng nghe. Bạn có thể tiếp tục chia sẻ trong 3 lượt trao đổi tiếp theo nhé."
+        message = chat_repo.collection.document()
+        payload = {"success": True, "session_id": session.id, "session_status": "active",
+            "user_extended": True, "can_reply": True, "can_extend": False,
+            "message": "Phiên trò chuyện đã được gia hạn thêm 3 lượt.",
+            "assistant_message": _message_payload(message.id, "assistant", content, session.id, now)}
+        updates = {"status": "active", "user_extended": True, "closed_at": None,
+            "closed_reason": None, "last_activity_at": now, "updated_at": now}
+        await asyncio.to_thread(ledger.complete, claim, payload, [
+            (chat_session_repo.collection.document(session.id), updates, True),
+            (message, {"assessment_id": assessment_id, "user_id": user["uid"], "session_id": session.id,
+                "role": "assistant", "content": content, "created_at": now, "analysis": None}, False)])
+        return payload
+    finally:
+        await _release_claim(ledger, claim)
 
 
 @router.post("/{assessment_id}/chat/close", response_model=dict)
 async def close_chat_session(
-    assessment_id: str,
-    user: dict = Depends(get_current_user),
+    assessment_id: str, user: dict = Depends(get_current_user),
     chat_session_repo: ChatSessionRepository = Depends(get_chat_session_repo),
     assessment_repo: AssessmentSessionRepository = Depends(get_assessment_repo),
 ):
-    """
-    Chủ động đóng phiên trò chuyện khi người dùng chọn 'Tôi đã ổn, muốn nghỉ ngơi'.
-    """
-    user_id = user["uid"]
-    assessment = assessment_repo.get(assessment_id)
-    if not assessment:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Assessment not found",
-        )
-    if assessment.get("user_id") != user_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized for this assessment",
-        )
-
-    session = chat_session_repo.get_active_session(assessment_id)
-    if not session:
-        return {
-            "success": True,
-            "message": "Phiên trò chuyện đã được đóng từ trước.",
-            "session_status": "closed",
-        }
-
-    chat_session_repo.close_session(
-        session_id=session.id,
-        reason="manual_user_decision",
-        summary="Người dùng chủ động hoàn thành phiên tham vấn để nghỉ ngơi.",
-    )
-    return {
-        "success": True,
-        "message": "Đã hoàn tất phiên trò chuyện thành công.",
-        "session_id": session.id,
-        "session_status": "closed",
-    }
+    _owned_assessment(assessment_id, user, assessment_repo)
+    ledger = ChatRequestRepository(chat_session_repo.db)
+    try:
+        claim = await asyncio.to_thread(ledger.claim, assessment_id, user["uid"], uuid4().hex, "close")
+    except ChatRequestConflict as exc:
+        raise HTTPException(409, {"code": str(exc)})
+    try:
+        session = _latest_session(chat_session_repo, assessment_id)
+        now = datetime.now(timezone.utc)
+        writes = []
+        if session:
+            writes.append((chat_session_repo.collection.document(session.id), {
+                "status": "closed", "closed_reason": "manual", "closed_at": session.closed_at or now,
+                "summary": session.summary or "Người dùng chủ động hoàn thành phiên để nghỉ ngơi.",
+                "updated_at": now}, True))
+        payload = {"success": True, "message": "Đã hoàn tất phiên trò chuyện.",
+            "session_status": "closed", "can_reply": False, "can_extend": False}
+        await asyncio.to_thread(ledger.complete, claim, payload, writes)
+        return payload
+    finally:
+        await _release_claim(ledger, claim)
 
 
 # ==========================================
@@ -1288,7 +787,8 @@ async def get_initial_greeting(
                 conversation_history=[],
                 message_count=1,
                 survey_context=survey_context,
-                include_analysis_in_prompt=False,
+                stage="greeting_and_probe",
+                assessment_id=assessment_id,
             )
             greeting_text = response.content
         except Exception as exc:

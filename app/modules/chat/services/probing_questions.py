@@ -210,7 +210,9 @@ class ProbingQuestionsService:
 
         # 1. Ưu tiên user_message (nếu user đã nói gì đó cụ thể)
         if user_message and user_message.strip():
-            topic = self._detect_topic_from_text(user_message, used_topics)
+            # Previously covered topics remain valid evidence. Avoid repeating
+            # the question, rather than changing the user's stated cause.
+            topic = self._detect_topic_from_text(user_message, set())
             if topic and topic in STA_QUESTION_CATALOG:
                 self._mark_used(session_id, topic, used_topics)
                 return STA_QUESTION_CATALOG[topic]
@@ -562,10 +564,18 @@ class ProbingQuestionsService:
             "cảm ơn",
             "cam on",
         ]
-        for phrase in stop_phrases:
-            if phrase in msg_lower:
-                return True
-        return False
+        normalized = re.sub(r"[.!?,;]+", " ", msg_lower)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        # Short acknowledgements may end a conversation; words embedded in a
+        # question ("mệt thôi", "không ngừng", "cảm ơn, cho mình hỏi") do not.
+        if normalized in stop_phrases:
+            return True
+        if re.fullmatch(r"(?:thôi(?: nhé)?(?: (?:tôi|mình|em) cần nghỉ)?|tạm dừng được rồi)", normalized):
+            return True
+        return bool(re.fullmatch(
+            r"(?:(?:tôi|mình|em)\s+)?(?:không muốn nói thêm|chưa muốn nói(?: thêm)?|không tiếp tục(?: nữa)?|muốn (?:dừng|tạm dừng)(?: lại)?|dừng lại|tạm dừng)(?:\s+(?:nữa|nhé|đâu|hôm nay|lúc này|bây giờ))*",
+            normalized,
+        ))
 
     def clear_assessment_questions(self, assessment_id: str) -> None:
         """Legacy: giữ API cũ, không còn dùng (state đã ở Firestore)."""

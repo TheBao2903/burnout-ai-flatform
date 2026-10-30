@@ -313,6 +313,9 @@ class ChatSessionRepository:
         now = datetime.utcnow()
         doc_ref = self.collection.document(session_id)
 
+        reason = "manual" if reason == "manual_user_decision" else reason
+        if reason not in {"idle_timeout", "max_duration", "manual", "completed_wrap_up", "max_turns_completed"}:
+            raise ValueError("Invalid chat session close reason")
         updates = {
             "status": "closed",
             "closed_at": now,

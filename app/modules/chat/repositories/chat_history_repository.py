@@ -48,6 +48,9 @@ class ChatHistoryRepository:
         ai_model: Optional[str] = None,
         session_id: Optional[str] = None,
         client_message_id: Optional[str] = None,
+        is_fallback: bool = False,
+        finish_reason: Optional[str] = None,
+        response_to: Optional[str] = None,
     ) -> str:
         """Lưu một tin nhắn chat vào Firestore.
 
@@ -94,6 +97,9 @@ class ChatHistoryRepository:
             "content": content,
             "analysis": analysis_data,
             "created_at": firestore.SERVER_TIMESTAMP,
+            "is_fallback": is_fallback,
+            "finish_reason": finish_reason,
+            "response_to": response_to,
         }
         # session_id is nullable - only add if provided (backward compatible)
         if session_id:
@@ -150,7 +156,7 @@ class ChatHistoryRepository:
         query = (
             self.collection
             .where("assessment_id", "==", assessment_id)
-            .order_by("created_at", direction=firestore.Query.ASCENDING)
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
             .limit(limit)
         )
         results = []
@@ -158,7 +164,7 @@ class ChatHistoryRepository:
             data = doc.to_dict() or {}
             data["id"] = doc.id
             results.append(data)
-        return results
+        return list(reversed(results))
 
     def list_by_user(
         self,
@@ -425,7 +431,7 @@ class ChatHistoryRepository:
         query = (
             self.collection
             .where("session_id", "==", session_id)
-            .order_by("created_at", direction=firestore.Query.ASCENDING)
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
             .limit(limit)
         )
         results = []
@@ -433,7 +439,7 @@ class ChatHistoryRepository:
             data = doc.to_dict() or {}
             data["id"] = doc.id
             results.append(data)
-        return results
+        return list(reversed(results))
 
 
 # ==========================================

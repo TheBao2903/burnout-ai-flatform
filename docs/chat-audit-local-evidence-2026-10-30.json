@@ -1,0 +1,78 @@
+{
+  "greeting_signature": {
+    "error": "missing a required argument: 'stage'"
+  },
+  "manual_close_reason": {
+    "persisted_status": "closed",
+    "persisted_reason": "manual_user_decision",
+    "invalid_field": [
+      "closed_reason"
+    ]
+  },
+  "false_stop": [
+    {
+      "message": "Mình chỉ thấy mệt thôi, nên nghỉ bao lâu?",
+      "wants_to_stop": true
+    },
+    {
+      "message": "Công việc không ngừng dồn tới, mình nên làm gì?",
+      "wants_to_stop": true
+    },
+    {
+      "message": "Cảm ơn, mình muốn hỏi thêm cách sắp xếp deadline.",
+      "wants_to_stop": true
+    }
+  ],
+  "crisis_scope": [
+    {
+      "message": "Tôi không tự tử trước đây, nhưng bây giờ tôi muốn chết.",
+      "detected": false
+    },
+    {
+      "message": "Hôm nay mệt chết đi được, tôi chỉ muốn ngủ một giấc không bao giờ dậy nữa.",
+      "detected": false
+    }
+  ],
+  "tagging_reselect": {
+    "cause_saved_from_first_call": "workload",
+    "action_saved_from_second_call": "recovery",
+    "used_topics": [
+      "recovery",
+      "workload"
+    ]
+  },
+  "recovery_accepts_MAX_TOKENS": {
+    "returned_as_success": [
+      "still incomplete",
+      "MAX_TOKENS"
+    ]
+  },
+  "recovery_accepts_SAFETY": {
+    "returned_as_success": [
+      "still incomplete",
+      "SAFETY"
+    ]
+  },
+  "bad_key_blocks_pool": {
+    "attempts": [
+      [
+        "bad",
+        "primary"
+      ]
+    ],
+    "error": "403 PERMISSION_DENIED API key was reported as leaked"
+  },
+  "concurrent_same_id": {
+    "requested_unique_messages": 1,
+    "saved_user_messages": 2,
+    "turn_count": 2,
+    "returned_turns": [
+      1,
+      2
+    ]
+  },
+  "empty_history_ownership": {
+    "foreign_session_id_returned": "foreign-session",
+    "can_extend": true
+  }
+}
