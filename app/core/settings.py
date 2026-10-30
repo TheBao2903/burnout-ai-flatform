@@ -11,11 +11,21 @@ doc dung tu os.environ. Trong code dung field name (snake_case).
 """
 
 import logging
+import re
 from functools import lru_cache
 from typing import List
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+GEMINI_TEXT_MODELS = ("gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
+
+
+def _within_gemini_version_limit(model: str) -> bool:
+    # Unversioned 'latest' aliases can silently resolve above the chosen cap.
+    version = re.match(r"^(?:models/)?gemini-(\d+)(?:\.(\d+))?-", model)
+    return bool(version and (int(version[1]), int(version[2] or 0)) <= (3, 6))
 
 
 class FirebaseSettings(BaseSettings):
@@ -125,12 +135,12 @@ class GoogleAISettings(BaseSettings):
         description="Google AI Studio API key dự phòng 5",
     )
     model: str = Field(
-        default="gemini-3.8-flash",
+        default=GEMINI_TEXT_MODELS[0],
         validation_alias=AliasChoices("GEMINI_MODEL"),
         description="Model Gemini su dung mac dinh",
     )
     models_csv: str = Field(
-        default="gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash-lite",
+        default=",".join(GEMINI_TEXT_MODELS),
         validation_alias=AliasChoices("GEMINI_MODELS"),
         description="Danh sach cac model xoay vong cach nhau boi dau phay",
     )
@@ -139,6 +149,15 @@ class GoogleAISettings(BaseSettings):
         validation_alias=AliasChoices("GEMINI_TIMEOUT_SECONDS"),
         description="Timeout goi API (seconds)",
     )
+
+    @field_validator("model")
+    @classmethod
+    def enforce_model_version_limit(cls, value: str) -> str:
+        value = value.strip()
+        if not _within_gemini_version_limit(value):
+            logging.getLogger(__name__).warning("Gemini primary model exceeds configured version policy; using 3.6 Flash")
+            return GEMINI_TEXT_MODELS[0]
+        return value
 
     @property
     def api_keys(self) -> list[str]:
@@ -156,10 +175,11 @@ class GoogleAISettings(BaseSettings):
     @property
     def model_pool(self) -> list[str]:
         """Danh sach cac model theo thu tu uu tien xoay vong."""
-        raw_list = [m.strip() for m in self.models_csv.split(",") if m.strip()]
-        if not raw_list:
-            return [self.model]
-        return raw_list
+        raw_list = list(dict.fromkeys(m.strip() for m in self.models_csv.split(",") if m.strip()))
+        allowed = [m for m in raw_list if _within_gemini_version_limit(m)]
+        if len(allowed) != len(raw_list):
+            logging.getLogger(__name__).warning("Ignored Gemini model pool entries above 3.6 or with unversioned aliases")
+        return allowed or [self.model, *[m for m in GEMINI_TEXT_MODELS if m != self.model]]
 
 
 class GoogleAIEmbedSettings(BaseSettings):

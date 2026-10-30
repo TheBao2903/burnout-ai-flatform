@@ -151,7 +151,7 @@ def test_gemini_rotator_model_pool_and_keys():
     keys = rotator._get_keys()
     assert len(keys) >= 1
     models = rotator._get_models()
-    assert "gemini-3.8-flash" in models
+    assert "gemini-3.6-flash" in models
     assert "gemini-3.5-flash-lite" in models
 
 
@@ -161,17 +161,17 @@ def test_gemini_rotator_failover_logic():
 
     def mock_call(client, model):
         calls.append(model)
-        if model == "gemini-3.8-flash":
-            raise RuntimeError("429 RESOURCE_EXHAUSTED Quota exceeded limit: 20 per day")
         if model == "gemini-3.6-flash":
+            raise RuntimeError("429 RESOURCE_EXHAUSTED Quota exceeded limit: 20 per day")
+        if model == "gemini-3.5-flash-lite":
             raise RuntimeError("503 UNAVAILABLE Model High Demand")
         return f"OK from {model}"
 
     res, model_used, _ = rotator.execute_with_failover(mock_call)
-    assert res == "OK from gemini-3.5-flash-lite"
-    assert model_used == "gemini-3.5-flash-lite"
-    assert "gemini-3.8-flash" in calls
+    assert res == "OK from gemini-3.1-flash-lite"
+    assert model_used == "gemini-3.1-flash-lite"
     assert "gemini-3.6-flash" in calls
+    assert "gemini-3.5-flash-lite" in calls
 
 
 # ==========================================

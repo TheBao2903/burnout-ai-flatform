@@ -16,10 +16,11 @@ Features:
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from google.cloud import firestore
+from google.api_core.exceptions import FailedPrecondition
 
 from app.core.firebase import FirestoreCollections, get_firebase
 from app.modules.chat.models.chat_history import (
@@ -153,18 +154,41 @@ class ChatHistoryRepository:
         Returns:
             List of message dicts (id included).
         """
-        query = (
-            self.collection
-            .where("assessment_id", "==", assessment_id)
-            .order_by("created_at", direction=firestore.Query.DESCENDING)
-            .limit(limit)
-        )
+        return self._get_recent_messages("assessment_id", assessment_id, limit)
+
+    def _get_recent_messages(self, field: str, value: str, limit: int) -> List[Dict[str, Any]]:
+        filtered = self.collection.where(field, "==", value)
+        try:
+            documents = list(filtered.order_by(
+                "created_at", direction=firestore.Query.DESCENDING,
+            ).limit(limit).stream())
+        except FailedPrecondition as exc:
+            if "requires an index" not in str(exc).lower():
+                raise
+            # Session history is small (STA 3/4 turns plus optional extension).
+            # A single-field query works while the composite index is absent
+            # or building. Do not limit before sorting: that loses newer rows.
+            logger.warning("Chat history composite index unavailable; using single-field query (%s)", field)
+            documents = list(filtered.stream())
+
         results = []
-        for doc in query.stream():
+        for doc in documents:
             data = doc.to_dict() or {}
+            if data.get("created_at") is None:
+                continue  # Match order_by semantics for missing fields.
             data["id"] = doc.id
             results.append(data)
-        return list(reversed(results))
+
+        def chronological(message):
+            created = message["created_at"]
+            if isinstance(created, str):
+                created = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            return created, message["id"]
+
+        results.sort(key=chronological)
+        return results[-limit:] if limit > 0 else []
 
     def list_by_user(
         self,
@@ -428,18 +452,7 @@ class ChatHistoryRepository:
         Returns:
             List of message dicts (id included).
         """
-        query = (
-            self.collection
-            .where("session_id", "==", session_id)
-            .order_by("created_at", direction=firestore.Query.DESCENDING)
-            .limit(limit)
-        )
-        results = []
-        for doc in query.stream():
-            data = doc.to_dict() or {}
-            data["id"] = doc.id
-            results.append(data)
-        return list(reversed(results))
+        return self._get_recent_messages("session_id", session_id, limit)
 
 
 # ==========================================

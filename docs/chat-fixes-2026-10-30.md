@@ -25,9 +25,9 @@ Giữ nguyên mục đích STA: chat bổ sung bối cảnh, không chẩn đoá
 
 Kiểm chứng hoàn tất:
 
-- **142 test backend đạt**, gồm chat, failover, các ca audit mới, dashboard và questionnaire. Chạy với SDK Gemini **1.56.0** và Pydantic **2.10.4** từ thư mục cài riêng để kiểm tra pin production đã sửa.
+- **146 test backend đạt**, gồm chat, failover, các ca audit mới, dashboard và questionnaire. Chạy với SDK Gemini **1.56.0** và Pydantic **2.10.4** từ thư mục cài riêng để kiểm tra pin production đã sửa.
 - **Build frontend đạt** (`npm run build`).
-- **4 nhóm ca browser đạt** bằng script [chat_browser_regression.py](../../frontend/tests/chat_browser_regression.py): bản nháp/ID/fallback/giờ; POST đến chậm; GET history đến chậm; close lỗi. Script dùng Firebase và backend giả lập, không cần tài khoản, không ghi production.
+- **5 nhóm ca browser đạt** bằng script [chat_browser_regression.py](../../frontend/tests/chat_browser_regression.py): tải lại history sau lỗi; bản nháp/ID/fallback/giờ; POST đến chậm; GET history đến chậm; close lỗi. Script dùng Firebase và backend giả lập, không cần tài khoản, không ghi production.
 - **2 lượt gọi Gemini thật đạt**, `is_fallback=false`, `finish_reason=STOP`, dùng SDK đã ghim. Không lưu hội thoại thử này vào dữ liệu người dùng.
 - `git diff --check` đạt.
 
@@ -40,3 +40,26 @@ Kiểm tra cuối bổ sung: timestamp của assistant được ghi sau timestam
 Giới hạn kiểm chứng: transaction được thử bằng kho mô phỏng có rollback và ràng buộc đọc trước ghi, chưa chạy Firestore emulator hoặc kiểm thử nhiều worker trên Render. Test pin SDK/Pydantic không phải bản sao đầy đủ Docker Linux. Chưa xác nhận end-to-end với bản sửa trên production vì chưa deploy.
 
 Để áp dụng: triển khai backend Render với `requirements.txt` mới, sau đó triển khai frontend Vercel. Kiểm tra lại một phiên thường, một phiên gia hạn, refresh history và retry trên bản production mới. Bộ sưu tập claim/cache `emotion_chat_operations` được backend Admin SDK tạo khi có request; không cần đổi luồng đăng nhập, schema questionnaire hoặc công thức tính điểm.
+
+## Sửa bổ sung sau deploy: lịch sử trả HTTP 500
+
+Đã tái hiện HTTP 500 trên API Render ở cả phiên mới và phiên ngày 14/10. `/chat/state` vẫn trả 200. Truy vấn trực tiếp bằng repository cũ tới Firestore thật báo `FailedPrecondition: The query requires an index` cho `session_id ASC, created_at DESC`. Kiểm tra local bằng kho mô phỏng trước đó đã bỏ sót điều kiện index này.
+
+Đã bổ sung cấu hình chuẩn `firestore.indexes.json` và chuyển `firebase.json` sang tham chiếu file. Giữ nguyên toàn bộ index đã khai báo trước đó, thêm index lịch sử theo session và bảo đảm khai báo index theo assessment với thời gian giảm dần.
+
+Tài khoản dịch vụ hiện tại trả 403 khi tạo index; không có index mới nào được tạo thành công trong đợt sửa này. Vì vậy repository đã có nhánh dự phòng chỉ dành cho lỗi thiếu index: query một trường bằng đúng session/assessment, đọc tập phù hợp, sắp theo thời gian và lấy các tin mới nhất. Không giới hạn trước khi sắp xếp; không bỏ qua lỗi Firestore khác. Frontend có nút “Thử tải lại” và xóa banner lỗi sau khi tải thành công.
+
+Đã đọc thành công dữ liệu thật của 4 assessment bằng repository mới; gọi trực tiếp hàm endpoint và serialize JSON thành công cho 3 assessment, gồm hai phiên cũ có 8 tin nhắn. Chỉ đọc dữ liệu, không sửa/xóa lịch sử. Đã thêm ca hồi quy thiếu index cho cả session và assessment, lỗi khác không bị che, cấu hình deploy và browser tải lại. Bản sửa bổ sung vẫn cần deploy backend để thay đổi API Render đang chạy; index không còn là điều kiện bắt buộc để tải được lịch sử.
+
+## Giới hạn model theo yêu cầu
+
+Danh sách mặc định mới: `gemini-3.6-flash` → `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`. Đã gọi thử trực tiếp cả ba bằng cấu hình thinking của ứng dụng: HTTP 200, finish reason STOP. Cập nhật defaults, `.env` local và Render Blueprint. Bộ lọc cấu hình loại model trên 3.6 và alias không có version như `gemini-flash-latest`, để cấu hình Render cũ không gọi lại 3.8. Embedding dùng lớp cấu hình riêng.
+
+Biến môi trường để đồng bộ trên Render:
+
+```env
+GEMINI_MODEL=gemini-3.6-flash
+GEMINI_MODELS=gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite
+```
+
+149 test backend đạt sau thay đổi này, gồm kiểm tra cấu hình cũ 3.8 bị loại và failover qua ba model mới. Cần deploy backend để áp dụng trên production.

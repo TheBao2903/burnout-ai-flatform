@@ -2,7 +2,7 @@
 Module quản lý xoay vòng API Keys và Models của Google Gemini (Dual Rotation Pool).
 Hỗ trợ:
 - Xoay vòng danh sách API Keys khi gặp 429 Rate Limit (RPM) hoặc Quota Exceeded (Daily RPD).
-- Xoay vòng danh sách Models (3.8-flash -> 3.6-flash -> 3.5-flash-lite) khi model hiện tại quá tải.
+- Xoay vòng danh sách Models (3.6-flash -> 3.5-flash-lite -> 3.1-flash-lite) khi model hiện tại quá tải.
 - Thread-safe, có cơ chế cooldown thông minh.
 """
 

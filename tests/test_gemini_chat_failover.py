@@ -10,6 +10,18 @@ from app.core.gemini_rotator import GeminiRotator
 from app.modules.chat.services.chat_response_generator import ChatResponseGenerator
 
 
+@pytest.mark.parametrize("configured, expected", [
+    ("gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash-lite", ["gemini-3.6-flash", "gemini-3.5-flash-lite"]),
+    ("gemini-3.8-flash,gemini-4-argon,gemini-flash-latest", ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]),
+    ("gemini-3.1-flash-lite,gemini-3.1-flash-lite,gemini-2.5-flash", ["gemini-3.1-flash-lite", "gemini-2.5-flash"]),
+])
+def test_stale_environment_cannot_reenable_models_above_36(configured, expected):
+    from app.core.settings import GoogleAISettings
+    settings = GoogleAISettings(_env_file=None, model="gemini-3.8-flash", models_csv=configured)
+    assert settings.model == "gemini-3.6-flash"
+    assert settings.model_pool == expected
+
+
 @pytest.fixture
 def rotator(monkeypatch):
     pool = GeminiRotator()

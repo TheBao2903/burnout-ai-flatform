@@ -292,6 +292,52 @@ def test_history_is_latest_and_isolated_by_session(stores):
     assert [m["content"] for m in messages] == list(map(str, range(54, 60)))
 
 
+@pytest.mark.parametrize("field", ["session_id", "assessment_id"])
+def test_missing_history_index_falls_back_without_losing_recent_messages(field):
+    from google.api_core.exceptions import FailedPrecondition
+    repo = ChatHistoryRepository.__new__(ChatHistoryRepository)
+    repo.collection = Mock()
+    filtered = repo.collection.where.return_value
+    def missing_index():
+        raise FailedPrecondition("The query requires an index. You can create it here")
+        yield  # The real error is raised while consuming the stream.
+    filtered.order_by.return_value.limit.return_value.stream.side_effect = missing_index
+    base = datetime(2026, 10, 14, tzinfo=timezone.utc)
+    docs = []
+    for number in reversed(range(60)):
+        data = {"created_at": base + timedelta(seconds=number), "content": str(number)}
+        docs.append(NS(id=str(number), to_dict=lambda data=data: data))
+    filtered.stream.return_value = iter(docs)
+    messages = repo._get_recent_messages(field, "owned", 6)
+    assert [m["content"] for m in messages] == list(map(str, range(54, 60)))
+    repo.collection.where.assert_called_once_with(field, "==", "owned")
+    filtered.stream.assert_called_once_with()
+
+
+def test_history_does_not_hide_other_firestore_failures():
+    from google.api_core.exceptions import FailedPrecondition
+    repo = ChatHistoryRepository.__new__(ChatHistoryRepository)
+    repo.collection = Mock()
+    filtered = repo.collection.where.return_value
+    filtered.order_by.return_value.limit.return_value.stream.side_effect = FailedPrecondition("Database is unavailable")
+    with pytest.raises(FailedPrecondition, match="Database is unavailable"):
+        repo.get_messages_by_session("s")
+    filtered.stream.assert_not_called()
+
+
+def test_deploy_config_includes_both_recent_chat_history_indexes():
+    import json
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    config = json.loads((root / "firebase.json").read_text(encoding="utf-8"))
+    indexes = json.loads((root / config["firestore"]["indexes"]).read_text(encoding="utf-8"))["indexes"]
+    for field in ("session_id", "assessment_id"):
+        assert any(index["collectionGroup"] == "chat_history" and index["fields"] == [
+            {"fieldPath": field, "order": "ASCENDING"},
+            {"fieldPath": "created_at", "order": "DESCENDING"},
+        ] for index in indexes)
+
+
 def test_response_timestamps_always_include_timezone():
     result = api.ChatMessageResponse(message_id="x", role="assistant", content="x", created_at="2026-10-30T05:00:00")
     assert result.created_at.endswith("+00:00")
