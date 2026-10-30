@@ -51,6 +51,7 @@ venv.bak/
 tests/*
 !tests/test_questionnaire_contract.py
 !tests/test_dashboard_insight.py
+!tests/test_gemini_chat_failover.py
 .pytest_cache/
 .hypothesis/
 .tox/

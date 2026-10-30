@@ -12,6 +12,8 @@ import time
 from typing import Callable, Optional, Tuple, Any, List
 
 from google import genai
+from google.genai import types
+from httpx import TimeoutException, TransportError
 from app.core.settings import get_settings
 
 logger = logging.getLogger("burnout.gemini.rotator")
@@ -41,7 +43,15 @@ class GeminiRotator:
 
     def _get_client_for_key(self, api_key: str) -> genai.Client:
         if api_key not in self._clients:
-            self._clients[api_key] = genai.Client(api_key=api_key)
+            self._clients[api_key] = genai.Client(
+                api_key=api_key,
+                http_options=types.HttpOptions(
+                    timeout=get_settings().google_ai.timeout_seconds * 1000,
+                    # Let the pool handle retries instead of repeatedly waiting
+                    # for the same unavailable model inside the SDK.
+                    retry_options=types.HttpRetryOptions(attempts=1),
+                ),
+            )
         return self._clients[api_key]
 
     def _is_cooling_down(self, key: str, model: str) -> bool:
@@ -63,10 +73,10 @@ class GeminiRotator:
             # Chạm trần ngày (Daily Quota) hoặc hết tiền Prepay (402) -> khóa 6 giờ
             duration = 6 * 3600
             reason = "Daily Quota / Prepayment Depleted (402/RPD)"
-        elif "503" in err_str or "unavailable" in err_str or "high demand" in err_str:
+        elif any(token in err_str for token in ("500", "502", "503", "504", "unavailable", "high demand", "timeout", "deadline_exceeded")):
             # Quá tải tạm thời (503) -> khóa 30 giây
             duration = 30
-            reason = "503 Model High Demand"
+            reason = "Transient model / transport failure"
         else:
             # Mặc định: Giới hạn phút (5 RPM) -> khóa 65 giây
             duration = 65
@@ -122,9 +132,25 @@ class GeminiRotator:
                         or "resource_exhausted" in err_msg.lower()
                         or "prepayment" in err_msg.lower()
                     )
-                    is_503 = "503" in err_msg or "unavailable" in err_msg.lower()
+                    status_code = getattr(exc, "code", None)
+                    is_transient = (
+                        status_code in (500, 502, 503, 504)
+                        or isinstance(exc, (TimeoutError, TimeoutException, TransportError))
+                        or any(token in err_msg.lower() for token in (
+                            "500", "502", "503", "504", "unavailable",
+                            "deadline_exceeded", "timed out", "timeout",
+                        ))
+                    )
 
-                    if is_quota or is_503:
+                    if is_transient:
+                        # Changing keys does not fix an overloaded model. Move
+                        # straight to the next model and cool down this one.
+                        logger.warning("Gemini model %s temporarily unavailable (%s); trying next model", model, type(exc).__name__)
+                        for model_key in keys:
+                            self.mark_exhausted(model_key, model, "503 transient model failure")
+                        break
+
+                    if is_quota:
                         logger.warning(
                             "Call failed with pair (%s, %s): %s. Rotating to next pair...",
                             key_preview,

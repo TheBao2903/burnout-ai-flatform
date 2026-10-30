@@ -638,6 +638,8 @@ async def send_chat_message(
     analysis_data = None  # Q1: không còn analysis cho chat
     ai_model = None
     assistant_content = None
+    response_is_fallback = False
+    response_finish_reason = None
     try:
         response_generator = get_chat_response_generator()
         chat_response = await asyncio.to_thread(
@@ -651,6 +653,9 @@ async def send_chat_message(
             message_count=user_turn_count,
         )
         assistant_content = chat_response.content
+        response_is_fallback = chat_response.is_fallback
+        response_finish_reason = chat_response.finish_reason
+        logger.info("Chat generation stage=%s fallback=%s finish_reason=%s", current_stage, response_is_fallback, response_finish_reason)
 
         # 15. Context Tagging — chỉ ghi ở stage reflect_and_support
         # PR 2: Dùng cached topic từ generator (chat_response.follow_up_topic) thay vì
@@ -697,6 +702,8 @@ async def send_chat_message(
         # rồi. Đoạn này chỉ log warning.
         if not assistant_content:
             assistant_content = "Tôi ghi nhận chia sẻ của bạn. Hãy nghỉ ngơi nhé."
+            response_is_fallback = True
+            response_finish_reason = "GENERATION_ERROR"
 
     # 16. Save user & assistant messages (Q1: bỏ analysis, Q5: truyền client_message_id)
     user_message_id = chat_repo.save_message(
@@ -789,6 +796,8 @@ async def send_chat_message(
         "is_session_completed": is_session_completed,
         "session_status": "closed" if is_session_completed else "active",
         "current_stage": current_stage,
+        "is_fallback": response_is_fallback,
+        "finish_reason": response_finish_reason,
         "user_turn_count": user_turn_count,
         "can_extend": can_extend,
         "user_extended": was_user_extended,

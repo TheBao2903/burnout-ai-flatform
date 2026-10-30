@@ -20,6 +20,8 @@ NGUYÊN TẮC BẮT BUỘC:
 2. KHÔNG BIẾN THÀNH CHATBOT HỎI ĐÁP THÔNG THƯỜNG:
    - TUYỆT ĐỐI HẠN CHẾ các câu hỏi chung chung rập khuôn chỉ để duy trì trò chuyện như: "Bạn cảm thấy thế nào?", "Tại sao bạn lại cảm thấy như vậy?", "Bạn có muốn chia sẻ thêm không?".
    - THAY VÀO ĐÓ: Phản ánh/nhận định dựa trên dữ liệu người dùng vừa cung cấp, sau đó mới đặt 1 câu hỏi trọng tâm để xác định nguyên nhân cụ thể.
+   - Nếu người dùng đặt câu hỏi hoặc xin gợi ý cụ thể, hãy trả lời trực tiếp yêu cầu đó trước. Không thay câu trả lời bằng câu hỏi thu thập dữ liệu. Chỉ hỏi thêm khi còn thiếu thông tin cần thiết; không hỏi lại nguyên nhân họ đã nói rõ.
+   - Dùng lời trò chuyện gần gũi và phản ánh chi tiết thực tế trong tin nhắn; tránh mở đầu rập khuôn như "Qua thông tin ghi nhận ban đầu" hoặc "Tôi ghi nhận những chia sẻ của bạn".
 3. NGUYÊN TẮC MỤC TIÊU DỮ LIỆU (Data-driven Inquiry):
    - Mỗi câu hỏi phải có mục đích thu thập dữ liệu cụ thể: Workload (khối lượng), Deadline (thời gian), Task-switching (đa nhiệm), Support (hỗ trợ), Autonomy (quyền chủ động), Recovery (phục hồi), hoặc Disengagement (xa rời công việc).
 4. QUY TRÌNH SESSION KHÉP KÍN (Không hỏi lan man):
@@ -282,6 +284,7 @@ class ChatResponseGenerator:
 
         try:
             response_text, finish_reason = self._generate_with_gemini(prompt)
+            is_fallback = False
 
             # Q-B: Post-validation — nếu stage cấm hỏi mà output có '?',
             # thay bằng fallback stage-aware. KHÔNG cắt chuỗi.
@@ -298,12 +301,13 @@ class ChatResponseGenerator:
                     micro_action=micro_action,
                 )
                 finish_reason = finish_reason + "_STAGE_VIOLATION"
+                is_fallback = True
 
             return ChatResponse(
                 content=response_text,
                 analysis_context=analysis_context,
                 follow_up_topic=cached_probe.topic if cached_probe else self._extract_follow_up_topic(response_text),
-                is_fallback=False,
+                is_fallback=is_fallback,
                 finish_reason=finish_reason,
             )
         except Exception as exc:
@@ -492,8 +496,10 @@ class ChatResponseGenerator:
         stage_instruction = {
             "greeting_and_probe": (
                 "GIAI ĐOẠN 1 - GHI NHẬN & ĐẶT CÂU HỎI TRỌNG TÂM: "
-                "Chào hỏi ấm áp, phản ánh nhận định dựa trên dữ liệu người dùng vừa cung cấp trong khảo sát. "
-                f"ĐẶT DUY NHẤT 1 CÂU HỎI TRỌNG TÂM ĐỂ XÁC ĐỊNH NGUYÊN NHÂN: '{question_text}'."
+                "Phản hồi ấm áp dựa trên tin nhắn mới và dữ liệu khảo sát nếu có. "
+                "Nếu người dùng đang hỏi, trả lời câu hỏi đó trước. "
+                "Nếu nguyên nhân đã rõ, không hỏi lại mà đưa một gợi ý phù hợp. "
+                f"Chỉ khi cần làm rõ, hỏi tối đa 1 câu trọng tâm; có thể tham khảo: '{question_text}'."
             ),
             "clarifying_cause": (
                 "GIAI ĐOẠN 2 - XÁC ĐỊNH RÕ NGUYÊN NHÂN: "
